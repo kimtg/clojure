@@ -387,18 +387,34 @@ public static void loadResourceScript(Class c, String name, boolean failIfNotFou
 }
 
 static public long lastModified(URL url, String libfile) throws IOException{
+	String protocol = url.getProtocol();
+	if("file".equals(protocol))
+		{
+		try
+			{
+			return new File(url.toURI()).lastModified();
+			}
+		catch(URISyntaxException e)
+			{
+			return new File(url.getPath()).lastModified();
+			}
+		}
 	URLConnection connection = url.openConnection();
-	try {
-		if (url.getProtocol().equals("jar"))
-			return ((JarURLConnection) connection).getJarFile().getEntry(libfile).getTime();
-		else
-			return connection.getLastModified();
-	}
-	finally {
+	if("jar".equals(protocol))
+		{
+		java.util.zip.ZipEntry entry = ((JarURLConnection) connection).getJarFile().getEntry(libfile);
+		return entry != null ? entry.getTime() : 0L;
+		}
+	try
+		{
+		return connection.getLastModified();
+		}
+	finally
+		{
 		InputStream ins = connection.getInputStream();
-		if (ins != null)
+		if(ins != null)
 			ins.close();
-	}
+		}
 }
 
 static void compile(String cljfile) throws IOException{
@@ -482,12 +498,18 @@ private synchronized static void doInit() {
 		refer.invoke(CLOJURE);
 		maybeLoadResourceScript("user.clj");
 
-		// start socket servers
-		Var require = var("clojure.core", "require");
-		Symbol SERVER = Symbol.intern("clojure.core.server");
-		require.invoke(SERVER);
-		Var start_servers = var("clojure.core.server", "start-servers");
-		start_servers.invoke(System.getProperties());
+		// start socket servers if configured
+		Properties props = System.getProperties();
+		for(String propName : props.stringPropertyNames()) {
+			if(propName.startsWith("clojure.server.")) {
+				Var require = var("clojure.core", "require");
+				Symbol SERVER = Symbol.intern("clojure.core.server");
+				require.invoke(SERVER);
+				Var start_servers = var("clojure.core.server", "start-servers");
+				start_servers.invoke(props);
+				break;
+			}
+		}
 	}
 	catch(Exception e) {
 		throw Util.sneakyThrow(e);

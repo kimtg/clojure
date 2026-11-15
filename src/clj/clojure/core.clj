@@ -7303,8 +7303,6 @@ fails, attempts to require sym's namespace and retries."
         (f x y)))
     maps))
 
-(require '[clojure.java.io :as jio])
-
 (defn- normalize-slurp-opts
   [opts]
   (if (string? (first opts))
@@ -7320,9 +7318,11 @@ fails, attempts to require sym's namespace and retries."
    :tag String}
   ([f & opts]
      (let [opts (normalize-slurp-opts opts)
-           sw (java.io.StringWriter.)]
-       (with-open [^java.io.Reader r (apply jio/reader f opts)]
-         (jio/copy r sw)
+           sw (java.io.StringWriter.)
+           reader (requiring-resolve 'clojure.java.io/reader)
+           copy (requiring-resolve 'clojure.java.io/copy)]
+       (with-open [^java.io.Reader r (apply reader f opts)]
+         (copy r sw)
          (.toString sw)))))
 
 (defn spit
@@ -7330,8 +7330,9 @@ fails, attempts to require sym's namespace and retries."
   closes f. Options passed to clojure.java.io/writer."
   {:added "1.2"}
   [f content & options]
-  (with-open [^java.io.Writer w (apply jio/writer f options)]
-    (.write w (str content))))
+  (let [writer (requiring-resolve 'clojure.java.io/writer)]
+    (with-open [^java.io.Writer w (apply writer f options)]
+      (.write w (str content)))))
 
 ;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;; futures (needs proxy);;;;;;;;;;;;;;;;;;
 (defn future-call 

@@ -14,6 +14,7 @@ package clojure.lang;
 
 import java.io.ObjectStreamException;
 import java.io.Serializable;
+import java.lang.invoke.SwitchPoint;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 
@@ -87,11 +88,35 @@ static Keyword nsKey = Keyword.intern(null, "ns");
 volatile Object root;
 
 volatile boolean dynamic = false;
+private volatile SwitchPoint switchPoint = null;
 transient final AtomicBoolean threadBound;
 public final Symbol sym;
 public final Namespace ns;
 
 //IPersistentMap _meta;
+
+public SwitchPoint getSwitchPoint(){
+	SwitchPoint sp = this.switchPoint;
+	if(sp == null)
+		{
+		synchronized(this)
+			{
+			sp = this.switchPoint;
+			if(sp == null)
+				this.switchPoint = sp = new SwitchPoint();
+			}
+		}
+	return sp;
+}
+
+private void invalidateSwitchPoint(){
+	SwitchPoint sp = this.switchPoint;
+	if(sp != null)
+		{
+		this.switchPoint = null;
+		SwitchPoint.invalidateAll(new SwitchPoint[]{sp});
+		}
+}
 
 public static Object getThreadBindingFrame(){
 	return dvals.get();
@@ -105,13 +130,21 @@ public static void resetThreadBindingFrame(Object frame){
 	dvals.set((Frame) frame);
 }
 
-public Var setDynamic(){
-	this.dynamic = true;
+synchronized public Var setDynamic(){
+	if(!this.dynamic)
+		{
+		this.dynamic = true;
+		invalidateSwitchPoint();
+		}
 	return this;
 }
 
-public Var setDynamic(boolean b){
-	this.dynamic = b;
+synchronized public Var setDynamic(boolean b){
+	if(this.dynamic != b)
+		{
+		this.dynamic = b;
+		invalidateSwitchPoint();
+		}
 	return this;
 }
 
@@ -280,6 +313,7 @@ synchronized public void bindRoot(Object root){
 	Object oldroot = this.root;
 	this.root = root;
 	++rev;
+	invalidateSwitchPoint();
         alterMeta(dissoc, RT.list(macroKey));
     notifyWatches(oldroot,this.root);
 }
@@ -289,12 +323,14 @@ synchronized void swapRoot(Object root){
 	Object oldroot = this.root;
 	this.root = root;
 	++rev;
+	invalidateSwitchPoint();
     notifyWatches(oldroot,root);
 }
 
 synchronized public void unbindRoot(){
 	this.root = new Unbound(this);
 	++rev;
+	invalidateSwitchPoint();
 }
 
 synchronized public void commuteRoot(IFn fn) {
@@ -303,6 +339,7 @@ synchronized public void commuteRoot(IFn fn) {
 	Object oldroot = root;
 	this.root = newRoot;
 	++rev;
+	invalidateSwitchPoint();
     notifyWatches(oldroot,newRoot);
 }
 
@@ -312,6 +349,7 @@ synchronized public Object alterRoot(IFn fn, ISeq args) {
 	Object oldroot = root;
 	this.root = newRoot;
 	++rev;
+	invalidateSwitchPoint();
     notifyWatches(oldroot,newRoot);
 	return newRoot;
 }

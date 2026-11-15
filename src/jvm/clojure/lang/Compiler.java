@@ -24,6 +24,7 @@ import java.lang.invoke.MethodType;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Executable;
+import java.math.BigInteger;
 import java.util.*;
 import java.util.concurrent.Callable;
 import java.util.regex.Pattern;
@@ -234,6 +235,21 @@ static final public Var IN_CATCH_FINALLY = Var.create(null).setDynamic();
 static final public Var METHOD_RETURN_CONTEXT = Var.create(null).setDynamic();
 
 static final public Var NO_RECUR = Var.create(null).setDynamic();
+
+static final public Var DEF_VAR = Var.create(null).setDynamic();
+
+static final public Var SELF_CONTEXT = Var.create(null).setDynamic();
+
+static final public Var LONG_BOUNDS = Var.create(null).setDynamic();
+
+static final public Var INFER_SPECIALIZE = Var.create(Boolean.FALSE).setDynamic();
+
+static final Handle VAR_BOOTSTRAP_HANDLE =
+		new Handle(Opcodes.H_INVOKESTATIC,
+				"clojure/lang/VarBootstrap",
+				"bootstrapSelf",
+				"(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/Class;Ljava/lang/String;Ljava/lang/String;I)Ljava/lang/invoke/CallSite;",
+				false);
 
 //DynamicClassLoader
 static final public Var LOADER = Var.create().setDynamic();
@@ -587,9 +603,24 @@ static class DefExpr implements Expr{
 //					.without(Keyword.intern(null, "static"));
             mm = (IPersistentMap) elideMeta(mm);
 			Expr meta = mm.count()==0 ? null:analyze(context == C.EVAL ? context : C.EXPRESSION, mm);
+			Expr initExpr = null;
+			boolean initProvided = RT.count(form) == 3;
+			if(initProvided)
+				{
+				Var selfDefVar = (!isDynamic && !v.isDynamic() && !RT.booleanCast(RT.get(mm, redefKey, false))) ? v : null;
+				try
+					{
+					Var.pushThreadBindings(RT.map(DEF_VAR, selfDefVar));
+					initExpr = analyze(context == C.EVAL ? context : C.EXPRESSION, RT.third(form), v.sym.name);
+					}
+				finally
+					{
+					Var.popThreadBindings();
+					}
+				}
 			return new DefExpr((String) SOURCE.deref(), lineDeref(), columnDeref(),
-			                   v, analyze(context == C.EVAL ? context : C.EXPRESSION, RT.third(form), v.sym.name),
-			                   meta, RT.count(form) == 3, isDynamic);
+			                   v, initExpr,
+			                   meta, initProvided, isDynamic);
 		}
 	}
 }
@@ -1449,7 +1480,7 @@ static class InstanceFieldExpr extends FieldExpr implements AssignableExpr{
 		this.column = column;
 		this.tag = tag;
 		this.requireField = requireField;
-		if(field == null && RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
+		if(field == null && RT.booleanCast(RT.WARN_ON_REFLECTION.deref()) && !RT.booleanCast(INFER_SPECIALIZE.deref()))
 			{
 			if(targetClass == null)
 				{
@@ -1962,7 +1993,7 @@ static class InstanceMethodExpr extends MethodExpr{
 			if(methods.isEmpty())
 				{
 				method = null;
-				if(RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
+				if(RT.booleanCast(RT.WARN_ON_REFLECTION.deref()) && !RT.booleanCast(INFER_SPECIALIZE.deref()))
 					{
 					RT.errPrintWriter()
 						.format("Reflection warning, %s:%d:%d - call to method %s on %s can't be resolved (no such method).\n",
@@ -1992,7 +2023,7 @@ static class InstanceMethodExpr extends MethodExpr{
 					m = Reflector.getAsMethodOfPublicBase(m.getDeclaringClass(), m);
 					}
 				method = m;
-				if(method == null && RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
+				if(method == null && RT.booleanCast(RT.WARN_ON_REFLECTION.deref()) && !RT.booleanCast(INFER_SPECIALIZE.deref()))
 					{
 					RT.errPrintWriter()
 						.format("Reflection warning, %s:%d:%d - call to method %s on %s can't be resolved (argument types: %s).\n",
@@ -2003,7 +2034,7 @@ static class InstanceMethodExpr extends MethodExpr{
 		else
 			{
 			method = null;
-			if(RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
+			if(RT.booleanCast(RT.WARN_ON_REFLECTION.deref()) && !RT.booleanCast(INFER_SPECIALIZE.deref()))
 				{
 				RT.errPrintWriter()
 					.format("Reflection warning, %s:%d:%d - call to method %s can't be resolved (target class is unknown).\n",
@@ -2131,6 +2162,283 @@ static class InstanceMethodExpr extends MethodExpr{
 }
 
 
+static final class LongRange {
+	static final BigInteger LONG_MIN_BI = BigInteger.valueOf(Long.MIN_VALUE);
+	static final BigInteger LONG_MAX_BI = BigInteger.valueOf(Long.MAX_VALUE);
+	static final LongRange ANY = new LongRange(LONG_MIN_BI, LONG_MAX_BI);
+
+	final BigInteger min;
+	final BigInteger max;
+
+	LongRange(BigInteger min, BigInteger max) {
+		this.min = min;
+		this.max = max;
+	}
+
+	boolean isEmpty() {
+		return min.compareTo(max) > 0;
+	}
+
+	boolean fitsLong() {
+		return !isEmpty() && min.compareTo(LONG_MIN_BI) >= 0 && max.compareTo(LONG_MAX_BI) <= 0;
+	}
+
+	LongRange intersect(LongRange other) {
+		if(other == null)
+			return this;
+		return new LongRange(min.max(other.min), max.min(other.max));
+	}
+
+	LongRange clampLong() {
+		LongRange c = intersect(ANY);
+		return c.isEmpty() ? null : c;
+	}
+}
+
+static boolean isLongLikeExpr(Expr e) {
+	Class pc = maybePrimitiveType(e);
+	return pc == long.class || pc == int.class || pc == short.class || pc == byte.class || pc == char.class;
+}
+
+static LongRange evalLongRange(Expr e) {
+	if(!isLongLikeExpr(e))
+		return null;
+	if(e instanceof NumberExpr)
+		{
+		long v = ((NumberExpr) e).n.longValue();
+		BigInteger bi = BigInteger.valueOf(v);
+		return new LongRange(bi, bi);
+		}
+	if(e instanceof LocalBindingExpr)
+		{
+		IPersistentMap bounds = LONG_BOUNDS.isBound() ? (IPersistentMap) LONG_BOUNDS.deref() : null;
+		LongRange r = bounds != null ? (LongRange) RT.get(bounds, ((LocalBindingExpr) e).b) : null;
+		if(r != null)
+			return r;
+		}
+	if(e instanceof StaticMethodExpr)
+		{
+		StaticMethodExpr sme = (StaticMethodExpr) e;
+		if(sme.c == RT.class && "longCast".equals(sme.methodName) && sme.args.count() == 1)
+			{
+			LongRange argR = evalLongRange((Expr) sme.args.nth(0));
+			if(argR != null)
+				return argR;
+			}
+		if(sme.method != null && sme.c == Numbers.class && sme.method.getReturnType() == long.class)
+			{
+			String mn = sme.methodName;
+			if(sme.args.count() == 2 && ("add".equals(mn) || "minus".equals(mn) || "multiply".equals(mn)))
+				{
+				LongRange a = evalLongRange((Expr) sme.args.nth(0));
+				LongRange b = evalLongRange((Expr) sme.args.nth(1));
+				if(a != null && b != null && !a.isEmpty() && !b.isEmpty())
+					{
+					if("add".equals(mn))
+						return new LongRange(a.min.add(b.min), a.max.add(b.max)).clampLong();
+					if("minus".equals(mn))
+						return new LongRange(a.min.subtract(b.max), a.max.subtract(b.min)).clampLong();
+					BigInteger p1 = a.min.multiply(b.min);
+					BigInteger p2 = a.min.multiply(b.max);
+					BigInteger p3 = a.max.multiply(b.min);
+					BigInteger p4 = a.max.multiply(b.max);
+					BigInteger pmin = p1.min(p2).min(p3).min(p4);
+					BigInteger pmax = p1.max(p2).max(p3).max(p4);
+					return new LongRange(pmin, pmax).clampLong();
+					}
+				}
+			else if(sme.args.count() == 1 && ("inc".equals(mn) || "dec".equals(mn) || "minus".equals(mn)))
+				{
+				LongRange a = evalLongRange((Expr) sme.args.nth(0));
+				if(a != null && !a.isEmpty())
+					{
+					if("inc".equals(mn))
+						return new LongRange(a.min.add(BigInteger.ONE), a.max.add(BigInteger.ONE)).clampLong();
+					if("dec".equals(mn))
+						return new LongRange(a.min.subtract(BigInteger.ONE), a.max.subtract(BigInteger.ONE)).clampLong();
+					return new LongRange(a.max.negate(), a.min.negate()).clampLong();
+					}
+				}
+			}
+		}
+	Class pc = maybePrimitiveType(e);
+	if(pc == int.class)
+		return new LongRange(BigInteger.valueOf(Integer.MIN_VALUE), BigInteger.valueOf(Integer.MAX_VALUE));
+	if(pc == short.class)
+		return new LongRange(BigInteger.valueOf(Short.MIN_VALUE), BigInteger.valueOf(Short.MAX_VALUE));
+	if(pc == byte.class)
+		return new LongRange(BigInteger.valueOf(Byte.MIN_VALUE), BigInteger.valueOf(Byte.MAX_VALUE));
+	if(pc == char.class)
+		return new LongRange(BigInteger.ZERO, BigInteger.valueOf(Character.MAX_VALUE));
+	return LongRange.ANY;
+}
+
+private static IPersistentMap narrowLocalRange(IPersistentMap bounds, Expr expr, LongRange narrow) {
+	if(narrow == null || !(expr instanceof LocalBindingExpr))
+		return bounds;
+	LocalBinding lb = ((LocalBindingExpr) expr).b;
+	LongRange cur = (LongRange) RT.get(bounds, lb);
+	LongRange next = cur != null ? cur.intersect(narrow) : narrow.intersect(LongRange.ANY);
+	if(!next.isEmpty())
+		return bounds.assoc(lb, next);
+	return bounds;
+}
+
+static IPersistentMap refineBoundsForIf(Expr testexpr, IPersistentMap bounds, boolean isThen) {
+	if(bounds == null)
+		bounds = PersistentHashMap.EMPTY;
+	if(!(testexpr instanceof StaticMethodExpr))
+		return bounds;
+	StaticMethodExpr sme = (StaticMethodExpr) testexpr;
+	if(sme.method == null)
+		return bounds;
+	String mn = sme.methodName;
+	if(sme.c == Numbers.class && sme.args.count() == 1)
+		{
+		Expr a0 = (Expr) sme.args.nth(0);
+		if(!isLongLikeExpr(a0))
+			return bounds;
+		if("isZero".equals(mn))
+			{
+			if(isThen)
+				return narrowLocalRange(bounds, a0, new LongRange(BigInteger.ZERO, BigInteger.ZERO));
+			LongRange cur = evalLongRange(a0);
+			if(cur != null && cur.min.equals(BigInteger.ZERO))
+				return narrowLocalRange(bounds, a0, new LongRange(BigInteger.ONE, LongRange.LONG_MAX_BI));
+			if(cur != null && cur.max.equals(BigInteger.ZERO))
+				return narrowLocalRange(bounds, a0, new LongRange(LongRange.LONG_MIN_BI, BigInteger.valueOf(-1)));
+			return bounds;
+			}
+		if("isPos".equals(mn))
+			return narrowLocalRange(bounds, a0, isThen
+					? new LongRange(BigInteger.ONE, LongRange.LONG_MAX_BI)
+					: new LongRange(LongRange.LONG_MIN_BI, BigInteger.ZERO));
+		if("isNeg".equals(mn))
+			return narrowLocalRange(bounds, a0, isThen
+					? new LongRange(LongRange.LONG_MIN_BI, BigInteger.valueOf(-1))
+					: new LongRange(BigInteger.ZERO, LongRange.LONG_MAX_BI));
+		return bounds;
+		}
+	if(sme.args.count() == 2 &&
+			((sme.c == Numbers.class && ("lt".equals(mn) || "lte".equals(mn) || "gt".equals(mn) || "gte".equals(mn) || "equiv".equals(mn)))
+			|| (sme.c == Util.class && "equiv".equals(mn))))
+		{
+		Expr a0 = (Expr) sme.args.nth(0);
+		Expr a1 = (Expr) sme.args.nth(1);
+		if(!isLongLikeExpr(a0) || !isLongLikeExpr(a1))
+			return bounds;
+		LongRange r0 = evalLongRange(a0);
+		LongRange r1 = evalLongRange(a1);
+		if(r0 == null || r1 == null)
+			return bounds;
+		boolean effectiveLt = ("lt".equals(mn) && isThen) || ("gte".equals(mn) && !isThen);
+		boolean effectiveLte = ("lte".equals(mn) && isThen) || ("gt".equals(mn) && !isThen);
+		boolean effectiveGt = ("gt".equals(mn) && isThen) || ("lte".equals(mn) && !isThen);
+		boolean effectiveGte = ("gte".equals(mn) && isThen) || ("lt".equals(mn) && !isThen);
+		if(effectiveLt)
+			{
+			bounds = narrowLocalRange(bounds, a0, new LongRange(LongRange.LONG_MIN_BI, r1.max.subtract(BigInteger.ONE)));
+			bounds = narrowLocalRange(bounds, a1, new LongRange(r0.min.add(BigInteger.ONE), LongRange.LONG_MAX_BI));
+			}
+		else if(effectiveLte)
+			{
+			bounds = narrowLocalRange(bounds, a0, new LongRange(LongRange.LONG_MIN_BI, r1.max));
+			bounds = narrowLocalRange(bounds, a1, new LongRange(r0.min, LongRange.LONG_MAX_BI));
+			}
+		else if(effectiveGt)
+			{
+			bounds = narrowLocalRange(bounds, a0, new LongRange(r1.min.add(BigInteger.ONE), LongRange.LONG_MAX_BI));
+			bounds = narrowLocalRange(bounds, a1, new LongRange(LongRange.LONG_MIN_BI, r0.max.subtract(BigInteger.ONE)));
+			}
+		else if(effectiveGte)
+			{
+			bounds = narrowLocalRange(bounds, a0, new LongRange(r1.min, LongRange.LONG_MAX_BI));
+			bounds = narrowLocalRange(bounds, a1, new LongRange(LongRange.LONG_MIN_BI, r0.max));
+			}
+		else if("equiv".equals(mn))
+			{
+			if(isThen)
+				{
+				bounds = narrowLocalRange(bounds, a0, r1);
+				bounds = narrowLocalRange(bounds, a1, r0);
+				}
+			else
+				{
+				if(r1.min.equals(r1.max))
+					{
+					if(r0.min.equals(r1.min))
+						bounds = narrowLocalRange(bounds, a0, new LongRange(r0.min.add(BigInteger.ONE), r0.max));
+					else if(r0.max.equals(r1.max))
+						bounds = narrowLocalRange(bounds, a0, new LongRange(r0.min, r0.max.subtract(BigInteger.ONE)));
+					}
+				if(r0.min.equals(r0.max))
+					{
+					if(r1.min.equals(r0.min))
+						bounds = narrowLocalRange(bounds, a1, new LongRange(r1.min.add(BigInteger.ONE), r1.max));
+					else if(r1.max.equals(r0.max))
+						bounds = narrowLocalRange(bounds, a1, new LongRange(r1.min, r1.max.subtract(BigInteger.ONE)));
+					}
+				}
+			}
+		}
+	return bounds;
+}
+
+static Object findProvenUncheckedOps(Class c, java.lang.reflect.Method method, IPersistentVector args) {
+	if(method == null || c != Numbers.class || method.getReturnType() != long.class)
+		return null;
+	Class[] pts = method.getParameterTypes();
+	String mn = method.getName();
+	if(pts.length == 2 && pts[0] == long.class && pts[1] == long.class)
+		{
+		LongRange r0 = evalLongRange((Expr) args.nth(0));
+		LongRange r1 = evalLongRange((Expr) args.nth(1));
+		if(r0 == null || r1 == null || r0.isEmpty() || r1.isEmpty())
+			return null;
+		if("add".equals(mn))
+			{
+			if(new LongRange(r0.min.add(r1.min), r0.max.add(r1.max)).fitsLong())
+				return Integer.valueOf(Opcodes.LADD);
+			}
+		else if("minus".equals(mn))
+			{
+			if(new LongRange(r0.min.subtract(r1.max), r0.max.subtract(r1.min)).fitsLong())
+				return Integer.valueOf(Opcodes.LSUB);
+			}
+		else if("multiply".equals(mn))
+			{
+			BigInteger p1 = r0.min.multiply(r1.min);
+			BigInteger p2 = r0.min.multiply(r1.max);
+			BigInteger p3 = r0.max.multiply(r1.min);
+			BigInteger p4 = r0.max.multiply(r1.max);
+			if(new LongRange(p1.min(p2).min(p3).min(p4), p1.max(p2).max(p3).max(p4)).fitsLong())
+				return Integer.valueOf(Opcodes.LMUL);
+			}
+		}
+	else if(pts.length == 1 && pts[0] == long.class)
+		{
+		LongRange r0 = evalLongRange((Expr) args.nth(0));
+		if(r0 == null || r0.isEmpty())
+			return null;
+		if("minus".equals(mn))
+			{
+			if(new LongRange(r0.max.negate(), r0.min.negate()).fitsLong())
+				return Integer.valueOf(Opcodes.LNEG);
+			}
+		else if("inc".equals(mn))
+			{
+			if(new LongRange(r0.min.add(BigInteger.ONE), r0.max.add(BigInteger.ONE)).fitsLong())
+				return new Object[]{Opcodes.LCONST_1, Opcodes.LADD};
+			}
+		else if("dec".equals(mn))
+			{
+			if(new LongRange(r0.min.subtract(BigInteger.ONE), r0.max.subtract(BigInteger.ONE)).fitsLong())
+				return new Object[]{Opcodes.LCONST_1, Opcodes.LSUB};
+			}
+		}
+	return null;
+}
+
 static class StaticMethodExpr extends MethodExpr{
 	//final String className;
 	public final Class c;
@@ -2140,6 +2448,7 @@ static class StaticMethodExpr extends MethodExpr{
 	public final int line;
 	public final int column;
 	public final java.lang.reflect.Method method;
+	public final Object provenUncheckedOps;
 	public final Symbol tag;
 	public final boolean tailPosition;
 	final static Method forNameMethod = Method.getMethod("Class classForName(String)");
@@ -2162,8 +2471,9 @@ static class StaticMethodExpr extends MethodExpr{
 		this.tag = tag;
 		this.tailPosition = tailPosition;
 		this.method = preferredMethod;
+		this.provenUncheckedOps = findProvenUncheckedOps(c, method, args);
 
-		if(method != null && warnOnBoxedKeyword.equals(RT.UNCHECKED_MATH.deref()) && isBoxedMath(method))
+		if(method != null && warnOnBoxedKeyword.equals(RT.UNCHECKED_MATH.deref()) && isBoxedMath(method) && !RT.booleanCast(INFER_SPECIALIZE.deref()))
 		{
 			RT.errPrintWriter()
 					.format("Boxed math warning, %s:%d:%d - call: %s.\n",
@@ -2202,13 +2512,14 @@ static class StaticMethodExpr extends MethodExpr{
 			methodidx = getMatchingParams(methodName, params, args, rets);
 			}
 		method = (java.lang.reflect.Method) (methodidx >= 0 ? methods.get(methodidx) : null);
-		if(method == null && RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
+		this.provenUncheckedOps = findProvenUncheckedOps(c, method, args);
+		if(method == null && RT.booleanCast(RT.WARN_ON_REFLECTION.deref()) && !RT.booleanCast(INFER_SPECIALIZE.deref()))
 			{
 			RT.errPrintWriter()
 				.format("Reflection warning, %s:%d:%d - call to static method %s on %s can't be resolved (argument types: %s).\n",
 					SOURCE_PATH.deref(), line, column, methodName, c.getName(), getTypeStringForArgs(args));
 			}
-		if(method != null && warnOnBoxedKeyword.equals(RT.UNCHECKED_MATH.deref()) && isBoxedMath(method))
+		if(method != null && warnOnBoxedKeyword.equals(RT.UNCHECKED_MATH.deref()) && isBoxedMath(method) && !RT.booleanCast(INFER_SPECIALIZE.deref()))
 			{
 			RT.errPrintWriter()
 				.format("Boxed math warning, %s:%d:%d - call: %s.\n",
@@ -2293,7 +2604,7 @@ static class StaticMethodExpr extends MethodExpr{
 				ObjMethod method = (ObjMethod) METHOD.deref();
 				method.emitClearLocals(gen);
 				}
-			Object ops = RT.get(Intrinsics.ops, method.toString());
+			Object ops = provenUncheckedOps != null ? provenUncheckedOps : RT.get(Intrinsics.ops, method.toString());
 			if(ops != null)
 				{
 				if(ops instanceof Object[])
@@ -2326,9 +2637,22 @@ static class StaticMethodExpr extends MethodExpr{
 				ObjMethod method = (ObjMethod) METHOD.deref();
 				method.emitClearThis(gen);
 				}
-			Type type = Type.getType(c);
-			Method m = new Method(methodName, Type.getReturnType(method), Type.getArgumentTypes(method));
-			gen.visitMethodInsn(INVOKESTATIC, type.getInternalName(), methodName, m.getDescriptor(), c.isInterface());
+			if(provenUncheckedOps != null)
+				{
+				if(provenUncheckedOps instanceof Object[])
+					{
+					for(Object op : (Object[]) provenUncheckedOps)
+						gen.visitInsn((Integer) op);
+					}
+				else
+					gen.visitInsn((Integer) provenUncheckedOps);
+				}
+			else
+				{
+				Type type = Type.getType(c);
+				Method m = new Method(methodName, Type.getReturnType(method), Type.getArgumentTypes(method));
+				gen.visitMethodInsn(INVOKESTATIC, type.getInternalName(), methodName, m.getDescriptor(), c.isInterface());
+				}
 			//if(context != C.STATEMENT || method.getReturnType() == Void.TYPE)
 			Class retClass = method.getReturnType();
 			if(context == C.STATEMENT)
@@ -3117,7 +3441,7 @@ public static class NewExpr implements Expr{
 			}
 
 		this.ctor = ctoridx >= 0 ? (Constructor) ctors.get(ctoridx) : null;
-		if(ctor == null && RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
+		if(ctor == null && RT.booleanCast(RT.WARN_ON_REFLECTION.deref()) && !RT.booleanCast(INFER_SPECIALIZE.deref()))
 			{
 			RT.errPrintWriter()
               .format("Reflection warning, %s:%d:%d - call to %s ctor can't be resolved.\n",
@@ -3343,10 +3667,16 @@ public static class IfExpr implements Expr, MaybePrimitiveExpr{
 				throw Util.runtimeException("Too few arguments to if");
             PathNode branch = new PathNode(PATHTYPE.BRANCH, (PathNode) CLEAR_PATH.get());
             Expr testexpr = analyze(context == C.EVAL ? context : C.EXPRESSION, RT.second(form));
+            IPersistentMap curBounds = LONG_BOUNDS.isBound() ? (IPersistentMap) LONG_BOUNDS.deref() : null;
+            if(curBounds == null)
+                curBounds = PersistentHashMap.EMPTY;
+            IPersistentMap thenBounds = refineBoundsForIf(testexpr, curBounds, true);
+            IPersistentMap elseBounds = refineBoundsForIf(testexpr, curBounds, false);
             Expr thenexpr, elseexpr;
             try {
                 Var.pushThreadBindings(
-                        RT.map(CLEAR_PATH, new PathNode(PATHTYPE.PATH,branch)));
+                        RT.map(CLEAR_PATH, new PathNode(PATHTYPE.PATH,branch),
+                               LONG_BOUNDS, thenBounds));
                 thenexpr = analyze(context, RT.third(form));
                 }
             finally{
@@ -3354,7 +3684,8 @@ public static class IfExpr implements Expr, MaybePrimitiveExpr{
                 }
             try {
                 Var.pushThreadBindings(
-                        RT.map(CLEAR_PATH, new PathNode(PATHTYPE.PATH,branch)));
+                        RT.map(CLEAR_PATH, new PathNode(PATHTYPE.PATH,branch),
+                               LONG_BOUNDS, elseBounds));
                 elseexpr = analyze(context, RT.fourth(form));
                 }
             finally{
@@ -4033,11 +4364,18 @@ static class StaticInvokeExpr implements Expr, MaybePrimitiveExpr{
 	public final boolean variadic;
 	public final boolean tailPosition;
 	public final Object tag;
+	public final String methodName;
     Class jc;
 
 	StaticInvokeExpr(Type target, Class retClass, Class[] paramclasses, Type[] paramtypes, boolean variadic,
 	                 IPersistentVector args,Object tag, boolean tailPosition){
+		this(target, "invokeStatic", retClass, paramclasses, paramtypes, variadic, args, tag, tailPosition);
+	}
+
+	StaticInvokeExpr(Type target, String methodName, Class retClass, Class[] paramclasses, Type[] paramtypes, boolean variadic,
+	                 IPersistentVector args,Object tag, boolean tailPosition){
 		this.target = target;
+		this.methodName = methodName;
 		this.retClass = retClass;
 		this.paramclasses = paramclasses;
 		this.paramtypes = paramtypes;
@@ -4045,6 +4383,33 @@ static class StaticInvokeExpr implements Expr, MaybePrimitiveExpr{
 		this.variadic = variadic;
 		this.tailPosition = tailPosition;
 		this.tag = tag;
+	}
+
+	static boolean argsCompatibleForSpec(IPersistentVector argv, Class[] params) {
+		if(argv.count() != params.length)
+			return false;
+		for(int i = 0; i < params.length; i++)
+			{
+			Class pc = params[i];
+			if(pc == Object.class)
+				continue;
+			Class ac = maybePrimitiveType((Expr) argv.nth(i));
+			if(pc == long.class)
+				{
+				if(ac != long.class)
+					return false;
+				}
+			else if(pc == double.class)
+				{
+				if(ac != double.class)
+					return false;
+				}
+			else
+				{
+				return false;
+				}
+			}
+		return true;
 	}
 
 	public Object eval() {
@@ -4079,7 +4444,7 @@ static class StaticInvokeExpr implements Expr, MaybePrimitiveExpr{
 	}
 
 	public void emitUnboxed(C context, ObjExpr objx, GeneratorAdapter gen){
-		Method ms = new Method("invokeStatic", getReturnType(), paramtypes);
+		Method ms = new Method(methodName, getReturnType(), paramtypes);
 		if(variadic)
 			{
 			for(int i = 0; i < paramclasses.length - 1; i++)
@@ -4155,6 +4520,28 @@ static class StaticInvokeExpr implements Expr, MaybePrimitiveExpr{
 		if(method == null)
 			return null;
 
+		PersistentVector argv = PersistentVector.EMPTY;
+		for(ISeq s = RT.seq(args); s != null; s = s.next())
+			argv = argv.cons(analyze(C.EXPRESSION, s.first()));
+
+		String staticMethodName = "invokeStatic";
+		if(!variadic)
+			{
+			for(java.lang.reflect.Method m : allmethods)
+				{
+				if(Modifier.isStatic(m.getModifiers()) && m.getName().equals("invokeStatic$prim"))
+					{
+					Class[] spParams = m.getParameterTypes();
+					if(spParams.length == argcount && argsCompatibleForSpec(argv, spParams))
+						{
+						method = m;
+						staticMethodName = "invokeStatic$prim";
+						break;
+						}
+					}
+				}
+			}
+
 		Class retClass = method.getReturnType();
 
 		Class[] paramClasses = method.getParameterTypes();
@@ -4167,13 +4554,263 @@ static class StaticInvokeExpr implements Expr, MaybePrimitiveExpr{
 
 		Type target = Type.getType(c);
 
-		PersistentVector argv = PersistentVector.EMPTY;
-		for(ISeq s = RT.seq(args); s != null; s = s.next())
-			argv = argv.cons(analyze(C.EXPRESSION, s.first()));
-
-		return new StaticInvokeExpr(target,retClass,paramClasses, paramTypes,variadic, argv, tag, tailPosition);
+		return new StaticInvokeExpr(target, staticMethodName, retClass, paramClasses, paramTypes, variadic, argv, tag, tailPosition);
 	}
 
+}
+
+static final class SelfContext {
+	final FnExpr fn;
+	final String thisName;
+	final Var defVar;
+	final Set<Integer> fixedArities = new HashSet<Integer>();
+	int variadicReqArity = -1;
+	final Map<Integer, FnMethod> methodByArity = new HashMap<Integer, FnMethod>();
+	FnMethod variadicMethod = null;
+	final List<SelfInvokeExpr> allSelfInvokes = new ArrayList<SelfInvokeExpr>();
+
+	SelfContext(FnExpr fn, String thisName, Var defVar) {
+		this.fn = fn;
+		this.thisName = thisName;
+		this.defVar = defVar;
+	}
+
+	boolean hasArity(int arity) {
+		if(fixedArities.contains(arity))
+			return true;
+		return variadicReqArity >= 0 && arity >= variadicReqArity;
+	}
+
+	FnMethod findMethod(int arity) {
+		FnMethod m = methodByArity.get(arity);
+		if(m != null)
+			return m;
+		if(variadicMethod != null && arity >= variadicMethod.reqParms.count())
+			return variadicMethod;
+		return null;
+	}
+
+	void registerMethod(FnMethod m) {
+		if(m.isVariadic())
+			variadicMethod = m;
+		else
+			methodByArity.put(m.reqParms.count(), m);
+	}
+
+	void resolveAllTargets() {
+		for(SelfInvokeExpr sie : allSelfInvokes)
+			sie.resolveTarget();
+	}
+}
+
+static class SelfInvokeExpr implements Expr, MaybePrimitiveExpr {
+	public final SelfContext selfCtx;
+	public final IPersistentVector args;
+	public final Object tag;
+	public final boolean tailPosition;
+	public final boolean isVarSelfCall;
+	public final Var defVar;
+	public final int line;
+	public final int column;
+	public final String source;
+	public FnMethod resolvedTarget;
+	Class jc;
+
+	SelfInvokeExpr(SelfContext selfCtx, IPersistentVector args, Object tag, boolean tailPosition,
+	               boolean isVarSelfCall, Var defVar, int line, int column, String source) {
+		this.selfCtx = selfCtx;
+		this.args = args;
+		this.tag = tag;
+		this.tailPosition = tailPosition;
+		this.isVarSelfCall = isVarSelfCall;
+		this.defVar = defVar;
+		this.line = line;
+		this.column = column;
+		this.source = source;
+		if(isVarSelfCall && defVar != null)
+			registerVar(defVar);
+		resolveTarget();
+	}
+
+	void resolveTarget() {
+		FnMethod base = selfCtx.findMethod(args.count());
+		if(base == null)
+			{
+			this.resolvedTarget = null;
+			return;
+			}
+		if(base.specMethod != null && StaticInvokeExpr.argsCompatibleForSpec(args, base.specMethod.argclasses))
+			this.resolvedTarget = base.specMethod;
+		else
+			this.resolvedTarget = base;
+	}
+
+	public Object eval() {
+		throw new UnsupportedOperationException("Can't eval SelfInvokeExpr");
+	}
+
+	public boolean hasJavaClass() {
+		return true;
+	}
+
+	public Class getJavaClass() {
+		if(jc == null)
+			{
+			Class rc = (resolvedTarget != null) ? resolvedTarget.retClass : Object.class;
+			jc = retType((tag != null) ? HostExpr.tagToClass(tag) : null, rc);
+			}
+		return jc;
+	}
+
+	public boolean canEmitPrimitive() {
+		return resolvedTarget != null && Util.isPrimitive(resolvedTarget.retClass);
+	}
+
+	private void emitSelfArgs(ObjExpr objx, GeneratorAdapter gen, FnMethod tm) {
+		if(tm.isVariadic())
+			{
+			int reqCount = tm.reqParms.count();
+			for(int i = 0; i < reqCount; i++)
+				((Expr) args.nth(i)).emit(C.EXPRESSION, objx, gen);
+			if(args.count() == reqCount)
+				{
+				gen.visitInsn(Opcodes.ACONST_NULL);
+				}
+			else
+				{
+				IPersistentVector restArgs = RT.subvec(args, reqCount, args.count());
+				MethodExpr.emitArgsAsArray(restArgs, objx, gen);
+				gen.invokeStatic(Type.getType(ArraySeq.class), Method.getMethod("clojure.lang.ArraySeq create(Object[])"));
+				}
+			}
+		else
+			{
+			MethodExpr.emitTypedArgs(objx, gen, tm.argclasses, args);
+			}
+	}
+
+	public void emitUnboxed(C context, ObjExpr objx, GeneratorAdapter gen) {
+		doEmitCall(context, objx, gen, true);
+	}
+
+	public void emit(C context, ObjExpr objx, GeneratorAdapter gen) {
+		doEmitCall(context, objx, gen, false);
+	}
+
+	private void doEmitCall(C context, ObjExpr objx, GeneratorAdapter gen, boolean wantUnboxed) {
+		if(resolvedTarget == null)
+			resolveTarget();
+		FnMethod tm = resolvedTarget;
+		boolean directLinking = RT.booleanCast(getCompilerOption(directLinkingKey));
+		Class retClass = tm != null ? tm.retClass : Object.class;
+		boolean resultIsObjectOnStack = false;
+
+		if(tm != null && objx.canBeDirect)
+			{
+			String targetName = tm.isSpecialized ? "invokeStatic$prim" : "invokeStatic";
+			Type retType = Type.getType(retClass);
+			emitSelfArgs(objx, gen, tm);
+			gen.visitLineNumber(line, gen.mark());
+			if(!isVarSelfCall || directLinking)
+				{
+				gen.invokeStatic(objx.objtype, new Method(targetName, retType, tm.argtypes));
+				}
+			else
+				{
+				gen.visitInvokeDynamicInsn(
+						targetName,
+						Type.getMethodDescriptor(retType, tm.argtypes),
+						VAR_BOOTSTRAP_HANDLE,
+						new Object[]{
+								objx.objtype,
+								defVar.ns.name.name,
+								defVar.sym.name,
+								Integer.valueOf(tm.isVariadic() ? 1 : 0)
+						});
+				}
+			}
+		else if(tm != null && !isVarSelfCall)
+			{
+			// Closure calling itself via 'this'
+			gen.loadThis();
+			if(tm.isSpecialized)
+				{
+				emitSelfArgs(objx, gen, tm);
+				if(tailPosition)
+					((ObjMethod) METHOD.deref()).emitClearThis(gen);
+				gen.visitLineNumber(line, gen.mark());
+				gen.invokeVirtual(objx.objtype, new Method("invokePrim$prim", Type.getType(retClass), tm.argtypes));
+				}
+			else if(tm.prim != null)
+				{
+				emitSelfArgs(objx, gen, tm);
+				if(tailPosition)
+					((ObjMethod) METHOD.deref()).emitClearThis(gen);
+				Type rtype = (retClass == double.class || retClass == long.class) ? Type.getType(retClass) : OBJECT_TYPE;
+				gen.visitLineNumber(line, gen.mark());
+				gen.invokeVirtual(objx.objtype, new Method("invokePrim", rtype, tm.argtypes));
+				}
+			else
+				{
+				if(tm.isVariadic())
+					{
+					emitSelfArgs(objx, gen, tm);
+					if(tailPosition)
+						((ObjMethod) METHOD.deref()).emitClearThis(gen);
+					gen.visitLineNumber(line, gen.mark());
+					gen.invokeVirtual(objx.objtype, new Method(tm.getMethodName(), tm.getReturnType(), tm.getArgTypes()));
+					}
+				else
+					{
+					emitSelfArgs(objx, gen, tm);
+					if(tailPosition)
+						((ObjMethod) METHOD.deref()).emitClearThis(gen);
+					gen.visitLineNumber(line, gen.mark());
+					gen.invokeVirtual(objx.objtype, new Method(tm.getMethodName(), tm.getReturnType(), tm.getArgTypes()));
+					}
+				resultIsObjectOnStack = true;
+				}
+			}
+		else
+			{
+			// Fallback: dynamic/non-direct var call
+			objx.emitVarValue(gen, defVar);
+			gen.checkCast(IFN_TYPE);
+			for(int i = 0; i < Math.min(MAX_POSITIONAL_ARITY, args.count()); i++)
+				((Expr) args.nth(i)).emit(C.EXPRESSION, objx, gen);
+			if(args.count() > MAX_POSITIONAL_ARITY)
+				{
+				PersistentVector restArgs = PersistentVector.EMPTY;
+				for(int i = MAX_POSITIONAL_ARITY; i < args.count(); i++)
+					restArgs = restArgs.cons(args.nth(i));
+				MethodExpr.emitArgsAsArray(restArgs, objx, gen);
+				}
+			gen.visitLineNumber(line, gen.mark());
+			if(tailPosition && !objx.canBeDirect)
+				((ObjMethod) METHOD.deref()).emitClearThis(gen);
+			gen.invokeInterface(IFN_TYPE, new Method("invoke", OBJECT_TYPE,
+					ARG_TYPES[Math.min(MAX_POSITIONAL_ARITY + 1, args.count())]));
+			resultIsObjectOnStack = true;
+			}
+
+		if(wantUnboxed)
+			{
+			if(resultIsObjectOnStack && retClass.isPrimitive())
+				HostExpr.emitUnboxArg(objx, gen, retClass);
+			}
+		else if(context == C.STATEMENT)
+			{
+			if(!resultIsObjectOnStack && (retClass == long.class || retClass == double.class))
+				gen.pop2();
+			else if(resultIsObjectOnStack || retClass != void.class)
+				gen.pop();
+			}
+		else
+			{
+			if(!resultIsObjectOnStack)
+				HostExpr.emitBoxReturn(objx, gen, retClass);
+			}
+	}
 }
 
 static class InvokeExpr implements Expr{
@@ -4388,6 +5025,46 @@ static class InvokeExpr implements Expr{
 		boolean tailPosition = inTailCall(context);
 		if(context != C.EVAL)
 			context = C.EXPRESSION;
+		if(context != C.EVAL && SELF_CONTEXT.isBound() && SELF_CONTEXT.deref() != null && form.first() instanceof Symbol)
+			{
+			SelfContext sc = (SelfContext) SELF_CONTEXT.deref();
+			Symbol op = (Symbol) form.first();
+			int arity = RT.count(form.next());
+			if(sc.hasArity(arity))
+				{
+				boolean isLocalThis = false;
+				boolean isVarSelf = false;
+				LocalBinding shadowed = LOCAL_ENV.isBound() ? (LocalBinding) RT.get(LOCAL_ENV.deref(), op) : null;
+				if(op.ns == null && sc.thisName != null && op.name.equals(sc.thisName))
+					{
+					if(shadowed != null && shadowed.idx == 0)
+						isLocalThis = true;
+					}
+				else if(sc.defVar != null && shadowed == null)
+					{
+					Object resolved = null;
+					try
+						{
+						resolved = resolve(op);
+						}
+					catch(Throwable t)
+						{
+						resolved = null;
+						}
+					if(resolved == sc.defVar)
+						isVarSelf = true;
+					}
+				if(isLocalThis || isVarSelf)
+					{
+					PersistentVector args = PersistentVector.EMPTY;
+					for(ISeq s = RT.seq(form.next()); s != null; s = s.next())
+						args = args.cons(analyze(context, s.first()));
+					SelfInvokeExpr sie = new SelfInvokeExpr(sc, args, tagOf(form), tailPosition, isVarSelf, sc.defVar, lineDeref(), columnDeref(), (String) SOURCE.deref());
+					sc.allSelfInvokes.add(sie);
+					return sie;
+					}
+				}
+			}
 		Expr fexpr = analyze(context, form.first());
 		if(fexpr instanceof VarExpr && ((VarExpr)fexpr).var.equals(INSTANCE) && RT.count(form) == 3)
 			{
@@ -4531,6 +5208,871 @@ static class SourceDebugExtensionAttribute extends Attribute{
 	}
 }
 
+static final class NumericInference {
+	enum ValKind {
+		UNKNOWN,
+		LONG,
+		DOUBLE,
+		ANY_NUM,
+		CONFLICT,
+		RECUR
+	}
+
+	static Class tryResolveTagClass(Object tag) {
+		if(tag == null)
+			return null;
+		if(tag instanceof Class)
+			return (Class) tag;
+		if(tag instanceof Symbol)
+			{
+			Symbol sym = (Symbol) tag;
+			if(sym.ns == null)
+				{
+				Class c = primClass(sym);
+				if(c != null)
+					return c;
+				c = HostExpr.maybeSpecialTag(sym);
+				if(c != null)
+					return c;
+				}
+			}
+		return HostExpr.maybeClass(tag, false);
+	}
+
+	static final class MethodInfo {
+		final FnMethod method;
+		final ISeq clauseForm;
+		final int numParams;
+		final ValKind[] paramKinds;
+		final boolean[] paramFixed;
+		final Map<LocalBinding, Integer> paramIndexMap = new IdentityHashMap<LocalBinding, Integer>();
+		ValKind retKind = ValKind.UNKNOWN;
+		boolean fixedRetNonPrim = false;
+
+		MethodInfo(FnMethod method, ISeq clauseForm) {
+			this.method = method;
+			this.clauseForm = clauseForm;
+			this.numParams = method.reqParms.count();
+			this.paramKinds = new ValKind[numParams];
+			this.paramFixed = new boolean[numParams];
+
+			IPersistentVector parms = (IPersistentVector) RT.first(clauseForm);
+			Object rtag = tagOf(parms);
+			if(method.retClass == long.class)
+				{
+				retKind = ValKind.LONG;
+				}
+			else if(method.retClass == double.class)
+				{
+				retKind = ValKind.DOUBLE;
+				}
+			else if(rtag != null)
+				{
+				Class rtc = tryResolveTagClass(rtag);
+				if(rtc == null || !primClass(rtc).isPrimitive())
+					{
+					retKind = ValKind.CONFLICT;
+					fixedRetNonPrim = true;
+					}
+				}
+
+			for(int i = 0; i < numParams; i++)
+				{
+				LocalBinding lb = (LocalBinding) method.reqParms.nth(i);
+				paramIndexMap.put(lb, i);
+				Class ac = method.argclasses[i];
+				if(ac == long.class)
+					{
+					paramKinds[i] = ValKind.LONG;
+					paramFixed[i] = true;
+					}
+				else if(ac == double.class)
+					{
+					paramKinds[i] = ValKind.DOUBLE;
+					paramFixed[i] = true;
+					}
+				else if(lb.tag != null)
+					{
+					paramKinds[i] = ValKind.CONFLICT;
+					paramFixed[i] = true;
+					}
+				else
+					{
+					paramKinds[i] = ValKind.UNKNOWN;
+					paramFixed[i] = false;
+					}
+				}
+		}
+	}
+
+	static boolean canReParseBody(Expr e) {
+		if(e == null)
+			return true;
+		if(e instanceof FnExpr || e instanceof NewInstanceExpr || e instanceof DefExpr
+				|| e instanceof AssignExpr || e instanceof LetFnExpr)
+			return false;
+		if(e instanceof BodyExpr)
+			{
+			BodyExpr be = (BodyExpr) e;
+			for(int i = 0; i < be.exprs.count(); i++)
+				if(!canReParseBody((Expr) be.exprs.nth(i)))
+					return false;
+			return true;
+			}
+		if(e instanceof LetExpr)
+			{
+			LetExpr le = (LetExpr) e;
+			for(int i = 0; i < le.bindingInits.count(); i++)
+				if(!canReParseBody(((BindingInit) le.bindingInits.nth(i)).init))
+					return false;
+			return canReParseBody(le.body);
+			}
+		if(e instanceof IfExpr)
+			{
+			IfExpr ie = (IfExpr) e;
+			return canReParseBody(ie.testExpr) && canReParseBody(ie.thenExpr) && canReParseBody(ie.elseExpr);
+			}
+		if(e instanceof CaseExpr)
+			{
+			CaseExpr ce = (CaseExpr) e;
+			if(!canReParseBody(ce.expr) || !canReParseBody(ce.defaultExpr))
+				return false;
+			for(Expr te : ce.thens.values())
+				if(!canReParseBody(te))
+					return false;
+			return true;
+			}
+		if(e instanceof TryExpr)
+			{
+			TryExpr te = (TryExpr) e;
+			if(!canReParseBody(te.tryExpr) || !canReParseBody(te.finallyExpr))
+				return false;
+			for(int i = 0; i < te.catchExprs.count(); i++)
+				if(!canReParseBody(((TryExpr.CatchClause) te.catchExprs.nth(i)).handler))
+					return false;
+			return true;
+			}
+		if(e instanceof RecurExpr)
+			{
+			RecurExpr re = (RecurExpr) e;
+			for(int i = 0; i < re.args.count(); i++)
+				if(!canReParseBody((Expr) re.args.nth(i)))
+					return false;
+			return true;
+			}
+		if(e instanceof SelfInvokeExpr)
+			{
+			SelfInvokeExpr sie = (SelfInvokeExpr) e;
+			for(int i = 0; i < sie.args.count(); i++)
+				if(!canReParseBody((Expr) sie.args.nth(i)))
+					return false;
+			return true;
+			}
+		if(e instanceof StaticInvokeExpr)
+			{
+			StaticInvokeExpr sie = (StaticInvokeExpr) e;
+			for(int i = 0; i < sie.args.count(); i++)
+				if(!canReParseBody((Expr) sie.args.nth(i)))
+					return false;
+			return true;
+			}
+		if(e instanceof InvokeExpr)
+			{
+			InvokeExpr ie = (InvokeExpr) e;
+			if(!canReParseBody(ie.fexpr))
+				return false;
+			for(int i = 0; i < ie.args.count(); i++)
+				if(!canReParseBody((Expr) ie.args.nth(i)))
+					return false;
+			return true;
+			}
+		if(e instanceof StaticMethodExpr)
+			{
+			StaticMethodExpr sme = (StaticMethodExpr) e;
+			for(int i = 0; i < sme.args.count(); i++)
+				if(!canReParseBody((Expr) sme.args.nth(i)))
+					return false;
+			return true;
+			}
+		if(e instanceof InstanceMethodExpr)
+			{
+			InstanceMethodExpr ime = (InstanceMethodExpr) e;
+			if(!canReParseBody(ime.target))
+				return false;
+			for(int i = 0; i < ime.args.count(); i++)
+				if(!canReParseBody((Expr) ime.args.nth(i)))
+					return false;
+			return true;
+			}
+		if(e instanceof InstanceFieldExpr)
+			return canReParseBody(((InstanceFieldExpr) e).target);
+		if(e instanceof NewExpr)
+			{
+			NewExpr ne = (NewExpr) e;
+			for(int i = 0; i < ne.args.count(); i++)
+				if(!canReParseBody((Expr) ne.args.nth(i)))
+					return false;
+			return true;
+			}
+		if(e instanceof VectorExpr)
+			{
+			VectorExpr ve = (VectorExpr) e;
+			for(int i = 0; i < ve.args.count(); i++)
+				if(!canReParseBody((Expr) ve.args.nth(i)))
+					return false;
+			return true;
+			}
+		if(e instanceof ListExpr)
+			{
+			ListExpr le = (ListExpr) e;
+			for(int i = 0; i < le.args.count(); i++)
+				if(!canReParseBody((Expr) le.args.nth(i)))
+					return false;
+			return true;
+			}
+		if(e instanceof MapExpr)
+			{
+			MapExpr me = (MapExpr) e;
+			for(int i = 0; i < me.keyvals.count(); i++)
+				if(!canReParseBody((Expr) me.keyvals.nth(i)))
+					return false;
+			return true;
+			}
+		if(e instanceof SetExpr)
+			{
+			SetExpr se = (SetExpr) e;
+			for(int i = 0; i < se.keys.count(); i++)
+				if(!canReParseBody((Expr) se.keys.nth(i)))
+					return false;
+			return true;
+			}
+		if(e instanceof KeywordInvokeExpr)
+			return canReParseBody(((KeywordInvokeExpr) e).target);
+		if(e instanceof MetaExpr)
+			{
+			MetaExpr me = (MetaExpr) e;
+			return canReParseBody(me.expr) && canReParseBody(me.meta);
+			}
+		if(e instanceof InstanceOfExpr)
+			return canReParseBody(((InstanceOfExpr) e).expr);
+		if(e instanceof MonitorEnterExpr)
+			return canReParseBody(((MonitorEnterExpr) e).target);
+		if(e instanceof MonitorExitExpr)
+			return canReParseBody(((MonitorExitExpr) e).target);
+		if(e instanceof ThrowExpr)
+			return canReParseBody(((ThrowExpr) e).excExpr);
+		return true;
+	}
+
+	static ValKind joinBranch(ValKind a, ValKind b) {
+		if(a == ValKind.RECUR)
+			return b;
+		if(b == ValKind.RECUR)
+			return a;
+		if(a == ValKind.UNKNOWN)
+			return b;
+		if(b == ValKind.UNKNOWN)
+			return a;
+		if(a == ValKind.CONFLICT || b == ValKind.CONFLICT)
+			return ValKind.CONFLICT;
+		if(a == b)
+			return a;
+		if(a == ValKind.ANY_NUM || b == ValKind.ANY_NUM)
+			return ValKind.ANY_NUM;
+		return ValKind.CONFLICT;
+	}
+
+	static ValKind joinDemand(ValKind cur, ValKind incoming) {
+		if(incoming == ValKind.UNKNOWN || incoming == ValKind.RECUR)
+			return cur;
+		if(cur == ValKind.UNKNOWN || cur == ValKind.RECUR)
+			return incoming;
+		if(cur == ValKind.CONFLICT || incoming == ValKind.CONFLICT)
+			return ValKind.CONFLICT;
+		if(cur == incoming)
+			return cur;
+		if(cur == ValKind.ANY_NUM)
+			return incoming;
+		if(incoming == ValKind.ANY_NUM)
+			return cur;
+		return ValKind.CONFLICT;
+	}
+
+	static ValKind javaClassToValKind(Expr e) {
+		if(e == null || !e.hasJavaClass())
+			return ValKind.CONFLICT;
+		Class c = e.getJavaClass();
+		if(c == RECUR_CLASS)
+			return ValKind.RECUR;
+		if(c == long.class && (e instanceof MaybePrimitiveExpr) && ((MaybePrimitiveExpr) e).canEmitPrimitive())
+			return ValKind.LONG;
+		if(c == double.class && (e instanceof MaybePrimitiveExpr) && ((MaybePrimitiveExpr) e).canEmitPrimitive())
+			return ValKind.DOUBLE;
+		return ValKind.CONFLICT;
+	}
+
+	static void demandExpr(Expr e, ValKind k, MethodInfo info,
+	                       Map<LocalBinding, LocalBinding> aliasMap,
+	                       Set<LocalBinding> visited) {
+		if(e == null || k == ValKind.UNKNOWN || k == ValKind.RECUR)
+			return;
+		if(e instanceof LocalBindingExpr)
+			{
+			LocalBinding lb = ((LocalBindingExpr) e).b;
+			while(aliasMap.containsKey(lb))
+				{
+				if(!visited.add(lb))
+					return;
+				lb = aliasMap.get(lb);
+				}
+			Integer idx = info.paramIndexMap.get(lb);
+			if(idx != null && !info.paramFixed[idx])
+				{
+				info.paramKinds[idx] = joinDemand(info.paramKinds[idx], k);
+				}
+			return;
+			}
+		if(e instanceof IfExpr)
+			{
+			IfExpr ie = (IfExpr) e;
+			demandExpr(ie.thenExpr, k, info, aliasMap, visited);
+			demandExpr(ie.elseExpr, k, info, aliasMap, visited);
+			return;
+			}
+		if(e instanceof BodyExpr)
+			{
+			BodyExpr be = (BodyExpr) e;
+			if(be.exprs.count() > 0)
+				demandExpr((Expr) be.exprs.nth(be.exprs.count() - 1), k, info, aliasMap, visited);
+			return;
+			}
+		if(e instanceof LetExpr && !((LetExpr) e).isLoop)
+			{
+			demandExpr(((LetExpr) e).body, k, info, aliasMap, visited);
+			return;
+			}
+		if(e instanceof CaseExpr)
+			{
+			CaseExpr ce = (CaseExpr) e;
+			demandExpr(ce.defaultExpr, k, info, aliasMap, visited);
+			for(Expr te : ce.thens.values())
+				demandExpr(te, k, info, aliasMap, visited);
+			}
+	}
+
+	static void markTargetConflict(Expr e, MethodInfo info, Map<LocalBinding, LocalBinding> aliasMap) {
+		demandExpr(e, ValKind.CONFLICT, info, aliasMap, Collections.newSetFromMap(new IdentityHashMap<LocalBinding, Boolean>()));
+	}
+
+	static ValKind inferExpr(Expr e, MethodInfo info,
+	                         Map<LocalBinding, ValKind> localTypes,
+	                         Map<LocalBinding, LocalBinding> aliasMap,
+	                         Map<FnMethod, MethodInfo> methodInfoMap,
+	                         SelfContext selfCtx) {
+		if(e == null)
+			return ValKind.CONFLICT;
+		if(e instanceof NumberExpr)
+			return javaClassToValKind(e);
+		if(e instanceof ConstantExpr || e instanceof NilExpr || e instanceof BooleanExpr
+				|| e instanceof StringExpr || e instanceof KeywordExpr || e instanceof EmptyExpr
+				|| e instanceof VarExpr || e instanceof TheVarExpr || e instanceof UnresolvedVarExpr
+				|| e instanceof StaticFieldExpr || e instanceof ImportExpr || e instanceof QualifiedMethodExpr)
+			return javaClassToValKind(e);
+		if(e instanceof LocalBindingExpr)
+			{
+			LocalBindingExpr lbe = (LocalBindingExpr) e;
+			Integer idx = info.paramIndexMap.get(lbe.b);
+			if(idx != null)
+				{
+				if(lbe.tag != null)
+					{
+					Class tc = tryResolveTagClass(lbe.tag);
+					if(tc == long.class && info.paramKinds[idx] == ValKind.LONG)
+						return ValKind.LONG;
+					if(tc == double.class && info.paramKinds[idx] == ValKind.DOUBLE)
+						return ValKind.DOUBLE;
+					return ValKind.CONFLICT;
+					}
+				return info.paramKinds[idx];
+				}
+			ValKind lk = localTypes.get(lbe.b);
+			if(lk != null)
+				return lk;
+			return javaClassToValKind(e);
+			}
+		if(e instanceof BodyExpr)
+			{
+			BodyExpr be = (BodyExpr) e;
+			ValKind last = ValKind.CONFLICT;
+			for(int i = 0; i < be.exprs.count(); i++)
+				last = inferExpr((Expr) be.exprs.nth(i), info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return last;
+			}
+		if(e instanceof IfExpr)
+			{
+			IfExpr ie = (IfExpr) e;
+			inferExpr(ie.testExpr, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			ValKind tk = inferExpr(ie.thenExpr, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			ValKind ek = inferExpr(ie.elseExpr, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return joinBranch(tk, ek);
+			}
+		if(e instanceof CaseExpr)
+			{
+			CaseExpr ce = (CaseExpr) e;
+			inferExpr(ce.expr, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			ValKind acc = inferExpr(ce.defaultExpr, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			for(Expr te : ce.thens.values())
+				acc = joinBranch(acc, inferExpr(te, info, localTypes, aliasMap, methodInfoMap, selfCtx));
+			return acc;
+			}
+		if(e instanceof LetExpr)
+			{
+			LetExpr le = (LetExpr) e;
+			for(int i = 0; i < le.bindingInits.count(); i++)
+				{
+				BindingInit bi = (BindingInit) le.bindingInits.nth(i);
+				ValKind ik = inferExpr(bi.init, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+				if(bi.binding.tag != null)
+					{
+					Class tc = tryResolveTagClass(bi.binding.tag);
+					if(tc == long.class)
+						ik = ValKind.LONG;
+					else if(tc == double.class)
+						ik = ValKind.DOUBLE;
+					else
+						ik = ValKind.CONFLICT;
+					}
+				else if(!le.isLoop && bi.init instanceof LocalBindingExpr)
+					{
+					aliasMap.put(bi.binding, ((LocalBindingExpr) bi.init).b);
+					}
+				localTypes.put(bi.binding, ik);
+				}
+			return inferExpr(le.body, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			}
+		if(e instanceof RecurExpr)
+			{
+			RecurExpr re = (RecurExpr) e;
+			for(int i = 0; i < re.args.count(); i++)
+				{
+				Expr a = (Expr) re.args.nth(i);
+				ValKind ak = inferExpr(a, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+				LocalBinding targetLb = (LocalBinding) re.loopLocals.nth(i);
+				Integer pIdx = info.paramIndexMap.get(targetLb);
+				if(pIdx != null)
+					{
+					if(!info.paramFixed[pIdx])
+						info.paramKinds[pIdx] = joinDemand(info.paramKinds[pIdx], ak);
+					}
+				else
+					{
+					ValKind cur = localTypes.get(targetLb);
+					if(cur != null)
+						localTypes.put(targetLb, joinBranch(cur, ak));
+					}
+				}
+			return ValKind.RECUR;
+			}
+		if(e instanceof SelfInvokeExpr)
+			{
+			SelfInvokeExpr sie = (SelfInvokeExpr) e;
+			ValKind[] akinds = new ValKind[sie.args.count()];
+			for(int i = 0; i < sie.args.count(); i++)
+				akinds[i] = inferExpr((Expr) sie.args.nth(i), info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			FnMethod target = selfCtx.findMethod(sie.args.count());
+			MethodInfo tInfo = target != null ? methodInfoMap.get(target) : null;
+			if(tInfo != null && !target.isVariadic())
+				{
+				for(int i = 0; i < sie.args.count(); i++)
+					{
+					if(!tInfo.paramFixed[i])
+						tInfo.paramKinds[i] = joinDemand(tInfo.paramKinds[i], akinds[i]);
+					if(tInfo.paramKinds[i] == ValKind.LONG || tInfo.paramKinds[i] == ValKind.DOUBLE || tInfo.paramKinds[i] == ValKind.ANY_NUM)
+						demandExpr((Expr) sie.args.nth(i), tInfo.paramKinds[i], info, aliasMap,
+								Collections.newSetFromMap(new IdentityHashMap<LocalBinding, Boolean>()));
+					}
+				return tInfo.retKind;
+				}
+			return ValKind.CONFLICT;
+			}
+		if(e instanceof StaticInvokeExpr)
+			{
+			StaticInvokeExpr sie = (StaticInvokeExpr) e;
+			for(int i = 0; i < sie.args.count(); i++)
+				inferExpr((Expr) sie.args.nth(i), info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return javaClassToValKind(sie);
+			}
+		if(e instanceof StaticMethodExpr)
+			{
+			StaticMethodExpr sme = (StaticMethodExpr) e;
+			Class c = sme.c;
+			String mn = sme.methodName;
+			int argc = sme.args.count();
+			if(c == Util.class && "identical".equals(mn) && argc == 2)
+				{
+				Expr a0 = (Expr) sme.args.nth(0);
+				Expr a1 = (Expr) sme.args.nth(1);
+				markTargetConflict(a0, info, aliasMap);
+				markTargetConflict(a1, info, aliasMap);
+				inferExpr(a0, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+				inferExpr(a1, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+				return ValKind.CONFLICT;
+				}
+			if(c == Util.class && "equiv".equals(mn) && argc == 2)
+				{
+				Expr a0 = (Expr) sme.args.nth(0);
+				Expr a1 = (Expr) sme.args.nth(1);
+				ValKind k0 = inferExpr(a0, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+				ValKind k1 = inferExpr(a1, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+				if(k1 == ValKind.LONG || k1 == ValKind.DOUBLE)
+					demandExpr(a0, k1, info, aliasMap, Collections.newSetFromMap(new IdentityHashMap<LocalBinding, Boolean>()));
+				if(k0 == ValKind.LONG || k0 == ValKind.DOUBLE)
+					demandExpr(a1, k0, info, aliasMap, Collections.newSetFromMap(new IdentityHashMap<LocalBinding, Boolean>()));
+				return ValKind.CONFLICT;
+				}
+			if(c == RT.class && argc == 1)
+				{
+				Expr a0 = (Expr) sme.args.nth(0);
+				inferExpr(a0, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+				if("longCast".equals(mn) || "uncheckedLongCast".equals(mn))
+					return ValKind.LONG;
+				if("doubleCast".equals(mn) || "uncheckedDoubleCast".equals(mn))
+					return ValKind.DOUBLE;
+				return ValKind.CONFLICT;
+				}
+			if(c == Numbers.class && argc == 1)
+				{
+				Expr a0 = (Expr) sme.args.nth(0);
+				ValKind k0 = inferExpr(a0, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+				if("not".equals(mn))
+					{
+					demandExpr(a0, ValKind.LONG, info, aliasMap, Collections.newSetFromMap(new IdentityHashMap<LocalBinding, Boolean>()));
+					return ValKind.LONG;
+					}
+				if("isZero".equals(mn) || "isPos".equals(mn) || "isNeg".equals(mn))
+					{
+					demandExpr(a0, ValKind.ANY_NUM, info, aliasMap, Collections.newSetFromMap(new IdentityHashMap<LocalBinding, Boolean>()));
+					return ValKind.CONFLICT;
+					}
+				if("incP".equals(mn) || "decP".equals(mn) || "minusP".equals(mn))
+					{
+					demandExpr(a0, ValKind.ANY_NUM, info, aliasMap, Collections.newSetFromMap(new IdentityHashMap<LocalBinding, Boolean>()));
+					return ValKind.CONFLICT;
+					}
+				if("inc".equals(mn) || "dec".equals(mn) || "minus".equals(mn)
+						|| "unchecked_inc".equals(mn) || "unchecked_dec".equals(mn) || "unchecked_minus".equals(mn))
+					{
+					demandExpr(a0, ValKind.ANY_NUM, info, aliasMap, Collections.newSetFromMap(new IdentityHashMap<LocalBinding, Boolean>()));
+					if(k0 == ValKind.LONG || k0 == ValKind.DOUBLE || k0 == ValKind.UNKNOWN || k0 == ValKind.ANY_NUM)
+						return k0;
+					return ValKind.CONFLICT;
+					}
+				return javaClassToValKind(sme);
+				}
+			if(c == Numbers.class && argc == 2)
+				{
+				Expr a0 = (Expr) sme.args.nth(0);
+				Expr a1 = (Expr) sme.args.nth(1);
+				ValKind k0 = inferExpr(a0, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+				ValKind k1 = inferExpr(a1, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+				boolean isArith = "add".equals(mn) || "minus".equals(mn) || "multiply".equals(mn)
+						|| "unchecked_add".equals(mn) || "unchecked_minus".equals(mn) || "unchecked_multiply".equals(mn);
+				boolean isDiv = "divide".equals(mn);
+				boolean isQuotRem = "quotient".equals(mn) || "remainder".equals(mn);
+				boolean isPred = "lt".equals(mn) || "lte".equals(mn) || "gt".equals(mn)
+						|| "gte".equals(mn) || "equiv".equals(mn) || "equal".equals(mn) || "compare".equals(mn);
+				boolean isBit = "and".equals(mn) || "or".equals(mn) || "xor".equals(mn) || "andNot".equals(mn)
+						|| "shiftLeft".equals(mn) || "shiftRight".equals(mn) || "unsignedShiftRight".equals(mn)
+						|| "clearBit".equals(mn) || "setBit".equals(mn) || "flipBit".equals(mn);
+				boolean isTestBit = "testBit".equals(mn);
+				boolean isBigArith = "addP".equals(mn) || "minusP".equals(mn) || "multiplyP".equals(mn);
+				if(isBit || isTestBit)
+					{
+					demandExpr(a0, ValKind.LONG, info, aliasMap, Collections.newSetFromMap(new IdentityHashMap<LocalBinding, Boolean>()));
+					demandExpr(a1, ValKind.LONG, info, aliasMap, Collections.newSetFromMap(new IdentityHashMap<LocalBinding, Boolean>()));
+					return isBit ? ValKind.LONG : ValKind.CONFLICT;
+					}
+				if(isArith || isDiv || isQuotRem || isPred || isBigArith)
+					{
+					ValKind d0 = (k1 == ValKind.DOUBLE || k1 == ValKind.LONG) ? k1 : ValKind.ANY_NUM;
+					ValKind d1 = (k0 == ValKind.DOUBLE || k0 == ValKind.LONG) ? k0 : ValKind.ANY_NUM;
+					demandExpr(a0, d0, info, aliasMap, Collections.newSetFromMap(new IdentityHashMap<LocalBinding, Boolean>()));
+					demandExpr(a1, d1, info, aliasMap, Collections.newSetFromMap(new IdentityHashMap<LocalBinding, Boolean>()));
+					if(isPred || isBigArith)
+						return ValKind.CONFLICT;
+					if(isDiv)
+						{
+						if(k0 == ValKind.DOUBLE || k1 == ValKind.DOUBLE)
+							return ValKind.DOUBLE;
+						return ValKind.CONFLICT;
+						}
+					if(isQuotRem)
+						{
+						if((k0 == ValKind.DOUBLE && (k1 == ValKind.DOUBLE || k1 == ValKind.LONG))
+								|| (k1 == ValKind.DOUBLE && (k0 == ValKind.DOUBLE || k0 == ValKind.LONG)))
+							return ValKind.DOUBLE;
+						if(k0 == ValKind.LONG && k1 == ValKind.LONG)
+							return ValKind.LONG;
+						if(k0 == ValKind.CONFLICT || k1 == ValKind.CONFLICT)
+							return ValKind.CONFLICT;
+						if(k0 == ValKind.UNKNOWN || k1 == ValKind.UNKNOWN)
+							return ValKind.UNKNOWN;
+						return ValKind.ANY_NUM;
+						}
+					// isArith
+					if(k0 == ValKind.DOUBLE || k1 == ValKind.DOUBLE)
+						return ValKind.DOUBLE;
+					if(k0 == ValKind.CONFLICT || k1 == ValKind.CONFLICT)
+						return ValKind.CONFLICT;
+					if(k0 == ValKind.LONG && k1 == ValKind.LONG)
+						return ValKind.LONG;
+					if(k0 == ValKind.UNKNOWN || k1 == ValKind.UNKNOWN)
+						return ValKind.UNKNOWN;
+					return ValKind.ANY_NUM;
+					}
+				return javaClassToValKind(sme);
+				}
+			for(int i = 0; i < argc; i++)
+				inferExpr((Expr) sme.args.nth(i), info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return javaClassToValKind(sme);
+			}
+		if(e instanceof InstanceFieldExpr)
+			{
+			Expr t = ((InstanceFieldExpr) e).target;
+			markTargetConflict(t, info, aliasMap);
+			inferExpr(t, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return javaClassToValKind(e);
+			}
+		if(e instanceof InstanceMethodExpr)
+			{
+			InstanceMethodExpr ime = (InstanceMethodExpr) e;
+			markTargetConflict(ime.target, info, aliasMap);
+			inferExpr(ime.target, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			for(int i = 0; i < ime.args.count(); i++)
+				inferExpr((Expr) ime.args.nth(i), info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return javaClassToValKind(ime);
+			}
+		if(e instanceof MonitorEnterExpr)
+			{
+			Expr t = ((MonitorEnterExpr) e).target;
+			markTargetConflict(t, info, aliasMap);
+			inferExpr(t, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return ValKind.CONFLICT;
+			}
+		if(e instanceof MonitorExitExpr)
+			{
+			Expr t = ((MonitorExitExpr) e).target;
+			markTargetConflict(t, info, aliasMap);
+			inferExpr(t, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return ValKind.CONFLICT;
+			}
+		if(e instanceof ThrowExpr)
+			{
+			Expr ex = ((ThrowExpr) e).excExpr;
+			markTargetConflict(ex, info, aliasMap);
+			inferExpr(ex, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return ValKind.CONFLICT;
+			}
+		if(e instanceof TryExpr)
+			{
+			TryExpr te = (TryExpr) e;
+			inferExpr(te.tryExpr, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			for(int i = 0; i < te.catchExprs.count(); i++)
+				inferExpr(((TryExpr.CatchClause) te.catchExprs.nth(i)).handler, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			inferExpr(te.finallyExpr, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return ValKind.CONFLICT;
+			}
+		if(e instanceof InvokeExpr)
+			{
+			InvokeExpr ie = (InvokeExpr) e;
+			inferExpr(ie.fexpr, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			for(int i = 0; i < ie.args.count(); i++)
+				inferExpr((Expr) ie.args.nth(i), info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return ValKind.CONFLICT;
+			}
+		if(e instanceof NewExpr)
+			{
+			NewExpr ne = (NewExpr) e;
+			for(int i = 0; i < ne.args.count(); i++)
+				inferExpr((Expr) ne.args.nth(i), info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return ValKind.CONFLICT;
+			}
+		if(e instanceof VectorExpr)
+			{
+			VectorExpr ve = (VectorExpr) e;
+			for(int i = 0; i < ve.args.count(); i++)
+				inferExpr((Expr) ve.args.nth(i), info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return ValKind.CONFLICT;
+			}
+		if(e instanceof ListExpr)
+			{
+			ListExpr le = (ListExpr) e;
+			for(int i = 0; i < le.args.count(); i++)
+				inferExpr((Expr) le.args.nth(i), info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return ValKind.CONFLICT;
+			}
+		if(e instanceof MapExpr)
+			{
+			MapExpr me = (MapExpr) e;
+			for(int i = 0; i < me.keyvals.count(); i++)
+				inferExpr((Expr) me.keyvals.nth(i), info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return ValKind.CONFLICT;
+			}
+		if(e instanceof SetExpr)
+			{
+			SetExpr se = (SetExpr) e;
+			for(int i = 0; i < se.keys.count(); i++)
+				inferExpr((Expr) se.keys.nth(i), info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return ValKind.CONFLICT;
+			}
+		if(e instanceof KeywordInvokeExpr)
+			{
+			inferExpr(((KeywordInvokeExpr) e).target, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return ValKind.CONFLICT;
+			}
+		if(e instanceof MetaExpr)
+			{
+			MetaExpr me = (MetaExpr) e;
+			inferExpr(me.expr, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			inferExpr(me.meta, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return ValKind.CONFLICT;
+			}
+		if(e instanceof InstanceOfExpr)
+			{
+			inferExpr(((InstanceOfExpr) e).expr, info, localTypes, aliasMap, methodInfoMap, selfCtx);
+			return ValKind.CONFLICT;
+			}
+		return ValKind.CONFLICT;
+	}
+
+	private static void runFixedPoint(List<MethodInfo> infos,
+	                                  Map<FnMethod, MethodInfo> methodInfoMap,
+	                                  SelfContext selfCtx) {
+		for(int iter = 0; iter < 16; iter++)
+			{
+			boolean changed = false;
+			for(MethodInfo info : infos)
+				{
+				ValKind[] beforeParams = info.paramKinds.clone();
+				ValKind beforeRet = info.retKind;
+				ValKind newRet = inferExpr(info.method.body, info,
+						new IdentityHashMap<LocalBinding, ValKind>(),
+						new IdentityHashMap<LocalBinding, LocalBinding>(),
+						methodInfoMap, selfCtx);
+				if(!info.fixedRetNonPrim && info.method.retClass == Object.class)
+					{
+					if(info.retKind == ValKind.CONFLICT)
+						newRet = ValKind.CONFLICT;
+					info.retKind = newRet;
+					}
+				if(info.retKind != beforeRet)
+					changed = true;
+				for(int i = 0; i < info.numParams; i++)
+					if(info.paramKinds[i] != beforeParams[i])
+						changed = true;
+				}
+			if(!changed)
+				break;
+			}
+	}
+
+	static void inferAndSpecialize(FnExpr fn,
+	                               List<ISeq> clauseForms,
+	                               List<FnMethod> methodList,
+	                               SelfContext selfCtx) {
+		List<MethodInfo> infos = new ArrayList<MethodInfo>();
+		Map<FnMethod, MethodInfo> methodInfoMap = new IdentityHashMap<FnMethod, MethodInfo>();
+		for(int i = 0; i < methodList.size(); i++)
+			{
+			FnMethod m = methodList.get(i);
+			if(!m.isVariadic() && m.reqParms.count() >= 1 && canReParseBody(m.body))
+				{
+				MethodInfo mi = new MethodInfo(m, clauseForms.get(i));
+				infos.add(mi);
+				methodInfoMap.put(m, mi);
+				}
+			}
+		if(infos.isEmpty())
+			return;
+
+		runFixedPoint(infos, methodInfoMap, selfCtx);
+
+		boolean promoted = false;
+		for(MethodInfo info : infos)
+			{
+			for(int i = 0; i < info.numParams; i++)
+				{
+				if(!info.paramFixed[i] && info.paramKinds[i] == ValKind.ANY_NUM)
+					{
+					info.paramKinds[i] = ValKind.LONG;
+					promoted = true;
+					}
+				}
+			}
+		if(promoted)
+			runFixedPoint(infos, methodInfoMap, selfCtx);
+
+		List<MethodInfo> toSpecialize = new ArrayList<MethodInfo>();
+		for(MethodInfo info : infos)
+			{
+			Class[] specArgClasses = new Class[info.numParams];
+			boolean hasPrimParam = false;
+			boolean differs = false;
+			for(int i = 0; i < info.numParams; i++)
+				{
+				if(info.paramKinds[i] == ValKind.LONG)
+					specArgClasses[i] = long.class;
+				else if(info.paramKinds[i] == ValKind.DOUBLE)
+					specArgClasses[i] = double.class;
+				else
+					specArgClasses[i] = Object.class;
+				if(specArgClasses[i].isPrimitive())
+					hasPrimParam = true;
+				if(specArgClasses[i] != info.method.argclasses[i])
+					differs = true;
+				}
+			Class specRetClass = Object.class;
+			if(info.retKind == ValKind.LONG)
+				specRetClass = long.class;
+			else if(info.retKind == ValKind.DOUBLE)
+				specRetClass = double.class;
+			if(specRetClass != info.method.retClass)
+				differs = true;
+
+			if(hasPrimParam && differs)
+				{
+				info.method.specMethod = FnMethod.createSpecShell(fn, info.method, specArgClasses, specRetClass);
+				toSpecialize.add(info);
+				}
+			}
+
+		for(MethodInfo info : toSpecialize)
+			{
+			FnMethod spec = info.method.specMethod;
+			FnMethod.parseSpecBody(fn, spec, info.clauseForm, fn.canBeDirect);
+			boolean mismatch = false;
+			for(int i = 0; i < spec.reqParms.count(); i++)
+				{
+				if(((LocalBinding) spec.reqParms.nth(i)).recurMistmatch)
+					{
+					mismatch = true;
+					break;
+					}
+				}
+			if(!mismatch && spec.retClass.isPrimitive())
+				{
+				Class bc = maybePrimitiveType(spec.body);
+				if(bc != spec.retClass && bc != RECUR_CLASS)
+					mismatch = true;
+				}
+			if(mismatch)
+				info.method.specMethod = null;
+			}
+
+		selfCtx.resolveAllTargets();
+	}
+}
+
 static public class FnExpr extends ObjExpr{
 	final static Type aFnType = Type.getType(AFunction.class);
 	final static Type restFnType = Type.getType(RestFn.class);
@@ -4620,6 +6162,8 @@ static public class FnExpr extends ObjExpr{
 		fn.internalName = fn.name.replace('.', '/');
 		fn.objtype = Type.getObjectType(fn.internalName);
 		ArrayList<String> prims = new ArrayList();
+		Var defVar = DEF_VAR.isBound() ? (Var) DEF_VAR.deref() : null;
+		SelfContext selfCtx = new SelfContext(fn, nm != null ? nm.name : null, defVar);
 		try
 			{
 			Var.pushThreadBindings(
@@ -4630,7 +6174,10 @@ static public class FnExpr extends ObjExpr{
 					       KEYWORD_CALLSITES, PersistentVector.EMPTY,
 					       PROTOCOL_CALLSITES, PersistentVector.EMPTY,
 					       //VAR_CALLSITES, emptyVarCallSites(),
-                                               NO_RECUR, null
+                                               NO_RECUR, null,
+					       SELF_CONTEXT, selfCtx,
+					       DEF_VAR, null,
+					       LONG_BOUNDS, PersistentHashMap.EMPTY
 					));
 
 			//arglist might be preceded by symbol naming this fn
@@ -4646,12 +6193,42 @@ static public class FnExpr extends ObjExpr{
 				form = RT.list(FN, RT.next(form));
 			fn.line = lineDeref();
 			fn.column = columnDeref();
+
+			// Pre-populate selfCtx arities before parsing bodies so recursive calls are intercepted in Pass 1
+			for(ISeq s = RT.next(form); s != null; s = RT.next(s))
+				{
+				Object cl = RT.first(s);
+				if(cl instanceof ISeq && RT.first(cl) instanceof IPersistentVector)
+					{
+					IPersistentVector parms = (IPersistentVector) RT.first(cl);
+					int ampIdx = -1;
+					for(int i = 0; i < parms.count(); i++)
+						{
+						if(_AMP_.equals(parms.nth(i)))
+							{
+							ampIdx = i;
+							break;
+							}
+						}
+					if(ampIdx >= 0)
+						selfCtx.variadicReqArity = ampIdx;
+					else
+						selfCtx.fixedArities.add(parms.count());
+					}
+				}
+
 			FnMethod[] methodArray = new FnMethod[MAX_POSITIONAL_ARITY + 1];
 			FnMethod variadicMethod = null;
 			boolean usesThis = false;
+			List<ISeq> clauseForms = new ArrayList<ISeq>();
+			List<FnMethod> methodList = new ArrayList<FnMethod>();
 			for(ISeq s = RT.next(form); s != null; s = RT.next(s))
 				{
-				FnMethod f = FnMethod.parse(fn, (ISeq) RT.first(s), rettag);
+				ISeq clauseForm = (ISeq) RT.first(s);
+				FnMethod f = FnMethod.parse(fn, clauseForm, rettag);
+				selfCtx.registerMethod(f);
+				clauseForms.add(clauseForm);
+				methodList.add(f);
 				if(f.usesThis)
 					{
 //					System.out.println(fn.name + " use this");
@@ -4701,6 +6278,9 @@ static public class FnExpr extends ObjExpr{
 						}
 					}
 				}
+
+			selfCtx.resolveAllTargets();
+			NumericInference.inferAndSpecialize(fn, clauseForms, methodList, selfCtx);
 
 			fn.methods = methods;
 			fn.variadicMethod = variadicMethod;
@@ -5924,6 +7504,8 @@ public static class FnMethod extends ObjMethod{
 	Class[] argclasses;
 	Class retClass;
 	String prim ;
+	FnMethod specMethod = null;
+	boolean isSpecialized = false;
 
 	public FnMethod(ObjExpr objx, ObjMethod parent){
 		super(objx, parent);
@@ -5956,6 +7538,82 @@ public static class FnMethod extends ObjMethod{
 		if(prim)
 			return "clojure.lang.IFn$" + ret;
 		return null;
+	}
+
+	static FnMethod createSpecShell(ObjExpr objx, FnMethod base, Class[] specArgClasses, Class specRetClass) {
+		FnMethod spec = new FnMethod(objx, base.parent);
+		spec.isSpecialized = true;
+		spec.line = base.line;
+		spec.column = base.column;
+		spec.retClass = specRetClass;
+		spec.argclasses = specArgClasses;
+		spec.argtypes = new Type[specArgClasses.length];
+		for(int i = 0; i < specArgClasses.length; i++)
+			spec.argtypes[i] = Type.getType(specArgClasses[i]);
+		return spec;
+	}
+
+	static void parseSpecBody(ObjExpr objx, FnMethod spec, ISeq form, boolean canBeDirect) {
+		IPersistentVector parms = (IPersistentVector) RT.first(form);
+		ISeq body = RT.next(form);
+		try
+			{
+			PathNode pnode = new PathNode(PATHTYPE.PATH, null);
+			spec.clearRoot = pnode;
+			Var.pushThreadBindings(
+					RT.mapUniqueKeys(
+							METHOD, spec,
+							LOCAL_ENV, LOCAL_ENV.deref(),
+							LOOP_LOCALS, null,
+							NEXT_LOCAL_NUM, 0,
+							CLEAR_PATH, pnode,
+							CLEAR_ROOT, pnode,
+							CLEAR_SITES, PersistentHashMap.EMPTY,
+							METHOD_RETURN_CONTEXT, RT.T,
+							LONG_BOUNDS, PersistentHashMap.EMPTY,
+							INFER_SPECIALIZE, RT.T
+					));
+
+			if(objx.thisName != null)
+				registerLocal(Symbol.intern(objx.thisName), null, null, false);
+			else
+				getAndIncLocalNum();
+
+			PersistentVector argLocals = PersistentVector.EMPTY;
+			for(int i = 0; i < spec.argclasses.length; i++)
+				{
+				Symbol p = (Symbol) parms.nth(i);
+				Class pc = spec.argclasses[i];
+				LocalBinding lb = pc.isPrimitive()
+						? registerLocal(p, null, new MethodParamExpr(pc), true)
+						: registerLocal(p, tagOf(p), null, true);
+				argLocals = argLocals.cons(lb);
+				spec.reqParms = spec.reqParms.cons(lb);
+				}
+			LOOP_LOCALS.set(argLocals);
+			spec.argLocals = argLocals;
+
+			for(int i = 0; i < spec.argclasses.length; i++)
+				{
+				if(spec.argclasses[i] == long.class || spec.argclasses[i] == double.class)
+					getAndIncLocalNum();
+				}
+
+			spec.body = (new BodyExpr.Parser()).parse(C.RETURN, body);
+
+			if(canBeDirect && spec.locals != null)
+				{
+				for(LocalBinding lb : (Collection<LocalBinding>) RT.keys(spec.locals))
+					{
+					if(lb.isArg)
+						lb.idx -= 1;
+					}
+				}
+			}
+		finally
+			{
+			Var.popThreadBindings();
+			}
 	}
 
 	static FnMethod parse(ObjExpr objx, ISeq form, Object rettag) {
@@ -6080,7 +7738,7 @@ public static class FnMethod extends ObjMethod{
 //			if(canBeDirect)
 			method.argtypes = argtypes.toArray(new Type[argtypes.size()]);
 			method.argclasses = argclasses.toArray(new Class[argtypes.size()]);
-			if(method.prim != null)
+			if(method.prim != null || method.isSpecialized)
 				{
 				for(int i = 0; i < method.argclasses.length; i++)
 					{
@@ -6102,17 +7760,157 @@ public static class FnMethod extends ObjMethod{
 			{
 //			System.out.println("emit static: " + fn.name);
 			doEmitStatic(fn, cv);
+			if(specMethod != null)
+				specMethod.doEmitStaticSpec(fn, cv);
 			}
 		else if(prim != null)
 			{
 //			System.out.println("emit prim: " + fn.name);
 			doEmitPrim(fn, cv);
+			if(specMethod != null)
+				specMethod.doEmitInstanceSpec(fn, cv);
 			}
 		else
 			{
 //			System.out.println("emit normal: " + fn.name);
 			doEmit(fn,cv);
+			if(specMethod != null)
+				specMethod.doEmitInstanceSpec(fn, cv);
 			}
+	}
+
+	private Label emitFastPathGuard(ObjExpr fn, GeneratorAdapter gen, boolean outerIsAllObject, Class outerRetClass) {
+		boolean needsCheck = false;
+		for(int i = 0; i < specMethod.argclasses.length; i++)
+			{
+			Class specC = specMethod.argclasses[i];
+			Class outerC = outerIsAllObject ? Object.class : this.argclasses[i];
+			if(specC.isPrimitive() && !outerC.isPrimitive())
+				{
+				needsCheck = true;
+				break;
+				}
+			}
+		Label fallbackLabel = needsCheck ? gen.newLabel() : null;
+		gen.visitLineNumber(line, gen.mark());
+		if(needsCheck)
+			{
+			for(int i = 0; i < specMethod.argclasses.length; i++)
+				{
+				Class specC = specMethod.argclasses[i];
+				Class outerC = outerIsAllObject ? Object.class : this.argclasses[i];
+				if(specC.isPrimitive() && !outerC.isPrimitive())
+					{
+					gen.loadArg(i);
+					gen.instanceOf(specC == long.class ? HostExpr.LONG_TYPE : HostExpr.DOUBLE_TYPE);
+					gen.ifZCmp(GeneratorAdapter.EQ, fallbackLabel);
+					}
+				}
+			}
+		if(!fn.canBeDirect)
+			gen.loadThis();
+		for(int i = 0; i < specMethod.argclasses.length; i++)
+			{
+			Class specC = specMethod.argclasses[i];
+			Class outerC = outerIsAllObject ? Object.class : this.argclasses[i];
+			gen.loadArg(i);
+			if(specC.isPrimitive() && !outerC.isPrimitive())
+				{
+				if(specC == long.class)
+					{
+					gen.checkCast(HostExpr.LONG_TYPE);
+					gen.invokeVirtual(HostExpr.LONG_TYPE, HostExpr.longValueMethod);
+					}
+				else if(specC == double.class)
+					{
+					gen.checkCast(HostExpr.DOUBLE_TYPE);
+					gen.invokeVirtual(HostExpr.DOUBLE_TYPE, HostExpr.doubleValueMethod);
+					}
+				}
+			}
+		if(fn.canBeDirect)
+			gen.invokeStatic(fn.objtype, new Method("invokeStatic$prim", Type.getType(specMethod.retClass), specMethod.argtypes));
+		else
+			gen.invokeVirtual(fn.objtype, new Method("invokePrim$prim", Type.getType(specMethod.retClass), specMethod.argtypes));
+		if(outerRetClass == Object.class && specMethod.retClass.isPrimitive())
+			HostExpr.emitBoxReturn(fn, gen, specMethod.retClass);
+		gen.returnValue();
+		if(fallbackLabel != null)
+			gen.mark(fallbackLabel);
+		return fallbackLabel;
+	}
+
+	public void doEmitStaticSpec(ObjExpr fn, ClassVisitor cv){
+		Type returnType = Type.getType(retClass);
+		Method ms = new Method("invokeStatic$prim", returnType, argtypes);
+
+		GeneratorAdapter gen = new GeneratorAdapter(ACC_PUBLIC + ACC_STATIC,
+		                                            ms,
+		                                            null,
+		                                            EXCEPTION_TYPES,
+		                                            cv);
+		gen.visitCode();
+		Label loopLabel = gen.mark();
+		gen.visitLineNumber(line, loopLabel);
+		try
+			{
+			Var.pushThreadBindings(RT.map(LOOP_LABEL, loopLabel, METHOD, this));
+			emitBody(objx, gen, retClass, body);
+
+			Label end = gen.mark();
+			int jvmSlot = 0;
+			int argIdx = 0;
+			for(ISeq lbs = argLocals.seq(); lbs != null; lbs = lbs.next(), argIdx++)
+				{
+				LocalBinding lb = (LocalBinding) lbs.first();
+				gen.visitLocalVariable(lb.name, argtypes[argIdx].getDescriptor(), null, loopLabel, end, jvmSlot);
+				jvmSlot += argtypes[argIdx].getSize();
+				}
+			}
+		finally
+			{
+			Var.popThreadBindings();
+			}
+
+		gen.returnValue();
+		gen.endMethod();
+	}
+
+	public void doEmitInstanceSpec(ObjExpr fn, ClassVisitor cv){
+		Type returnType = Type.getType(retClass);
+		Method ms = new Method("invokePrim$prim", returnType, argtypes);
+
+		GeneratorAdapter gen = new GeneratorAdapter(ACC_PUBLIC + ACC_FINAL,
+		                                            ms,
+		                                            null,
+		                                            EXCEPTION_TYPES,
+		                                            cv);
+		gen.visitCode();
+		Label loopLabel = gen.mark();
+		gen.visitLineNumber(line, loopLabel);
+		try
+			{
+			Var.pushThreadBindings(RT.map(LOOP_LABEL, loopLabel, METHOD, this));
+			emitBody(objx, gen, retClass, body);
+
+			Label end = gen.mark();
+			gen.visitLocalVariable("this", "Ljava/lang/Object;", null, loopLabel, end, 0);
+			int jvmSlot = 1;
+			int argIdx = 0;
+			for(ISeq lbs = argLocals.seq(); lbs != null; lbs = lbs.next(), argIdx++)
+				{
+				LocalBinding lb = (LocalBinding) lbs.first();
+				gen.visitLocalVariable(lb.name, argtypes[argIdx].getDescriptor(), null, loopLabel, end, jvmSlot);
+				jvmSlot += argtypes[argIdx].getSize();
+				}
+			}
+		finally
+			{
+			Var.popThreadBindings();
+			}
+
+		gen.returnValue();
+		gen.endMethod();
 	}
 
 	public void doEmitStatic(ObjExpr fn, ClassVisitor cv){
@@ -6131,26 +7929,30 @@ public static class FnMethod extends ObjMethod{
 		                                            EXCEPTION_TYPES,
 		                                            cv);
 		gen.visitCode();
-		Label loopLabel = gen.mark();
-		gen.visitLineNumber(line, loopLabel);
-		try
+		Label fallback = (specMethod != null) ? emitFastPathGuard(fn, gen, false, retClass) : null;
+		if(specMethod == null || fallback != null)
 			{
-			Var.pushThreadBindings(RT.map(LOOP_LABEL, loopLabel, METHOD, this));
-			emitBody(objx, gen, retClass, body);
-
-			Label end = gen.mark();
-			for(ISeq lbs = argLocals.seq(); lbs != null; lbs = lbs.next())
+			Label loopLabel = gen.mark();
+			gen.visitLineNumber(line, loopLabel);
+			try
 				{
-				LocalBinding lb = (LocalBinding) lbs.first();
-				gen.visitLocalVariable(lb.name, argtypes[lb.idx].getDescriptor(), null, loopLabel, end, lb.idx);
-				}
-			}
-		finally
-			{
-			Var.popThreadBindings();
-			}
+				Var.pushThreadBindings(RT.map(LOOP_LABEL, loopLabel, METHOD, this));
+				emitBody(objx, gen, retClass, body);
 
-		gen.returnValue();
+				Label end = gen.mark();
+				for(ISeq lbs = argLocals.seq(); lbs != null; lbs = lbs.next())
+					{
+					LocalBinding lb = (LocalBinding) lbs.first();
+					gen.visitLocalVariable(lb.name, argtypes[lb.idx].getDescriptor(), null, loopLabel, end, lb.idx);
+					}
+				}
+			finally
+				{
+				Var.popThreadBindings();
+				}
+
+			gen.returnValue();
+			}
 		//gen.visitMaxs(1, 1);
 		gen.endMethod();
 
@@ -6238,27 +8040,32 @@ public static class FnMethod extends ObjMethod{
 		                                            cv);
 		gen.visitCode();
 
-		Label loopLabel = gen.mark();
-		gen.visitLineNumber(line, loopLabel);
-		try
+		Class outerRetClass = (retClass == double.class || retClass == long.class) ? retClass : Object.class;
+		Label fallback = (specMethod != null) ? emitFastPathGuard(fn, gen, false, outerRetClass) : null;
+		if(specMethod == null || fallback != null)
 			{
-			Var.pushThreadBindings(RT.map(LOOP_LABEL, loopLabel, METHOD, this));
-			emitBody(objx, gen, retClass, body);
-
-			Label end = gen.mark();
-			gen.visitLocalVariable("this", "Ljava/lang/Object;", null, loopLabel, end, 0);
-			for(ISeq lbs = argLocals.seq(); lbs != null; lbs = lbs.next())
+			Label loopLabel = gen.mark();
+			gen.visitLineNumber(line, loopLabel);
+			try
 				{
-				LocalBinding lb = (LocalBinding) lbs.first();
-				gen.visitLocalVariable(lb.name, argtypes[lb.idx-1].getDescriptor(), null, loopLabel, end, lb.idx);
-				}
-			}
-		finally
-			{
-			Var.popThreadBindings();
-			}
+				Var.pushThreadBindings(RT.map(LOOP_LABEL, loopLabel, METHOD, this));
+				emitBody(objx, gen, retClass, body);
 
-		gen.returnValue();
+				Label end = gen.mark();
+				gen.visitLocalVariable("this", "Ljava/lang/Object;", null, loopLabel, end, 0);
+				for(ISeq lbs = argLocals.seq(); lbs != null; lbs = lbs.next())
+					{
+					LocalBinding lb = (LocalBinding) lbs.first();
+					gen.visitLocalVariable(lb.name, argtypes[lb.idx-1].getDescriptor(), null, loopLabel, end, lb.idx);
+					}
+				}
+			finally
+				{
+				Var.popThreadBindings();
+				}
+
+			gen.returnValue();
+			}
 		//gen.visitMaxs(1, 1);
 		gen.endMethod();
 
@@ -6303,28 +8110,32 @@ public static class FnMethod extends ObjMethod{
 		                                            cv);
 		gen.visitCode();
 
-		Label loopLabel = gen.mark();
-		gen.visitLineNumber(line, loopLabel);
-		try
+		Label fallback = (specMethod != null) ? emitFastPathGuard(fn, gen, true, Object.class) : null;
+		if(specMethod == null || fallback != null)
 			{
-			Var.pushThreadBindings(RT.map(LOOP_LABEL, loopLabel, METHOD, this));
-
-			body.emit(C.RETURN, fn, gen);
-			Label end = gen.mark();
-
-			gen.visitLocalVariable("this", "Ljava/lang/Object;", null, loopLabel, end, 0);
-			for(ISeq lbs = argLocals.seq(); lbs != null; lbs = lbs.next())
+			Label loopLabel = gen.mark();
+			gen.visitLineNumber(line, loopLabel);
+			try
 				{
-				LocalBinding lb = (LocalBinding) lbs.first();
-				gen.visitLocalVariable(lb.name, "Ljava/lang/Object;", null, loopLabel, end, lb.idx);
-				}
-			}
-		finally
-			{
-			Var.popThreadBindings();
-			}
+				Var.pushThreadBindings(RT.map(LOOP_LABEL, loopLabel, METHOD, this));
 
-		gen.returnValue();
+				body.emit(C.RETURN, fn, gen);
+				Label end = gen.mark();
+
+				gen.visitLocalVariable("this", "Ljava/lang/Object;", null, loopLabel, end, 0);
+				for(ISeq lbs = argLocals.seq(); lbs != null; lbs = lbs.next())
+					{
+					LocalBinding lb = (LocalBinding) lbs.first();
+					gen.visitLocalVariable(lb.name, "Ljava/lang/Object;", null, loopLabel, end, lb.idx);
+					}
+				}
+			finally
+				{
+				Var.popThreadBindings();
+				}
+
+			gen.returnValue();
+			}
 		//gen.visitMaxs(1, 1);
 		gen.endMethod();
 	}
@@ -6988,8 +8799,12 @@ public static class LetExpr implements Expr, MaybePrimitiveExpr{
 
 			//may repeat once for each binding with a mismatch, return breaks
 			while(true){
+				IPersistentMap initBounds = LONG_BOUNDS.isBound() ? (IPersistentMap) LONG_BOUNDS.deref() : null;
+				if(initBounds == null)
+					initBounds = PersistentHashMap.EMPTY;
 				IPersistentMap dynamicBindings = RT.map(LOCAL_ENV, LOCAL_ENV.deref(),
-														NEXT_LOCAL_NUM, NEXT_LOCAL_NUM.deref());
+														NEXT_LOCAL_NUM, NEXT_LOCAL_NUM.deref(),
+														LONG_BOUNDS, initBounds);
 				method.locals = backupMethodLocals;
 				method.indexlocals = backupMethodIndexLocals;
 
@@ -7021,7 +8836,7 @@ public static class LetExpr implements Expr, MaybePrimitiveExpr{
 							if(recurMismatches != null && RT.booleanCast(recurMismatches.nth(i/2)))
 								{
 								init = new StaticMethodExpr("", 0, 0, null, RT.class, "box", RT.vector(init), false);
-								if(RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
+								if(RT.booleanCast(RT.WARN_ON_REFLECTION.deref()) && !RT.booleanCast(INFER_SPECIALIZE.deref()))
 									RT.errPrintWriter().println("Auto-boxing loop arg: " + sym);
 								}
 							else if(maybePrimitiveType(init) == int.class)
@@ -7041,6 +8856,12 @@ public static class LetExpr implements Expr, MaybePrimitiveExpr{
 
 								}
 							LocalBinding lb = registerLocal(sym, tagOf(sym), init,false);
+							if(!isLoop && isLongLikeExpr(init))
+								{
+								LongRange r = evalLongRange(init);
+								if(r != null)
+									LONG_BOUNDS.set(((IPersistentMap) LONG_BOUNDS.deref()).assoc(lb, r));
+								}
 							BindingInit bi = new BindingInit(lb, init);
 							bindingInits = bindingInits.cons(bi);
 							if(isLoop)
@@ -7339,7 +9160,7 @@ public static class RecurExpr implements Expr, MaybePrimitiveExpr{
 					if(mismatch)
 						{
 						lb.recurMistmatch = true;
-						if(RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
+						if(RT.booleanCast(RT.WARN_ON_REFLECTION.deref()) && !RT.booleanCast(INFER_SPECIALIZE.deref()))
 							RT.errPrintWriter().println
 								(source + ":" + line +
 								 " recur arg for primitive local: " +
@@ -7538,7 +9359,7 @@ static public class CompilerException extends RuntimeException implements IExcep
 
 static public Var isMacro(Object op) {
 	//no local macros for now
-	if(op instanceof Symbol && referenceLocal((Symbol) op) != null)
+	if(op instanceof Symbol && LOCAL_ENV.isBound() && RT.get(LOCAL_ENV.deref(), op) != null)
 		return null;
 	if(op instanceof Symbol || op instanceof Var)
 		{
@@ -7555,7 +9376,7 @@ static public Var isMacro(Object op) {
 
 static public IFn isInline(Object op, int arity) {
 	//no local inlines for now
-	if(op instanceof Symbol && referenceLocal((Symbol) op) != null)
+	if(op instanceof Symbol && LOCAL_ENV.isBound() && RT.get(LOCAL_ENV.deref(), op) != null)
 		return null;
 	if(op instanceof Symbol || op instanceof Var)
 		{
@@ -9431,6 +11252,7 @@ public static class CaseExpr implements Expr, MaybePrimitiveExpr{
     final static Keyword hashIdentityKey = Keyword.intern(null, "hash-identity");
     final static Keyword hashEquivKey = Keyword.intern(null, "hash-equiv");
     final static Keyword intKey = Keyword.intern(null, "int");
+    private final boolean suppressWarnings = RT.booleanCast(INFER_SPECIALIZE.deref());
 	//(case* expr shift mask default map<minhash, [test then]> table-type test-type skip-check?)
 	public CaseExpr(int line, int column, LocalBindingExpr expr, int shift, int mask, int low, int high, Expr defaultExpr,
 	        SortedMap<Integer,Expr> tests,HashMap<Integer,Expr> thens, Keyword switchType, Keyword testType, Set<Integer> skipCheck){
@@ -9454,7 +11276,7 @@ public static class CaseExpr implements Expr, MaybePrimitiveExpr{
 		Collection<Expr> returns = new ArrayList(thens.values());
 		returns.add(defaultExpr);
 		this.returnType = maybeJavaClass(returns);
-        if(RT.count(skipCheck) > 0 && RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
+        if(RT.count(skipCheck) > 0 && RT.booleanCast(RT.WARN_ON_REFLECTION.deref()) && !suppressWarnings)
             {
             RT.errPrintWriter()
               .format("Performance warning, %s:%d:%d - hash collision of some case test constants; if selected, those entries will be tested sequentially.\n",
@@ -9559,7 +11381,7 @@ public static class CaseExpr implements Expr, MaybePrimitiveExpr{
     private void emitExprForInts(ObjExpr objx, GeneratorAdapter gen, Type exprType, Label defaultLabel){
         if (exprType == null)
             {
-            if(RT.booleanCast(RT.WARN_ON_REFLECTION.deref()))
+            if(RT.booleanCast(RT.WARN_ON_REFLECTION.deref()) && !suppressWarnings)
                 {
                 RT.errPrintWriter()
                   .format("Performance warning, %s:%d:%d - case has int tests, but tested expression is not primitive.\n",
